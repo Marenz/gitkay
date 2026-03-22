@@ -286,85 +286,100 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
 #[derive(Clone)]
 struct GraphRow {
     node_col: usize,
+    node_color: usize,
     lines: Vec<(usize, usize, usize)>,
     num_cols: usize,
 }
 
 fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
-    // Each pipe tracks (oid, color_index)
-    let mut pipes: Vec<(git2::Oid, usize)> = Vec::new();
+    // Each pipe tracks (oid, color_index). None = empty slot.
+    let mut pipes: Vec<Option<(git2::Oid, usize)>> = Vec::new();
     let mut next_color: usize = 0;
     let mut rows = Vec::new();
     let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
 
     for commit in commits {
+        // Find which column this commit is in
         let node_col = pipes
             .iter()
-            .position(|p| p.0 == commit.oid)
+            .position(|p| p.is_some_and(|(oid, _)| oid == commit.oid))
             .unwrap_or_else(|| {
+                // New commit — find an empty slot or append
                 let color = next_color;
                 next_color += 1;
-                pipes.push((commit.oid, color));
-                pipes.len() - 1
+                if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
+                    pipes[pos] = Some((commit.oid, color));
+                    pos
+                } else {
+                    pipes.push(Some((commit.oid, color)));
+                    pipes.len() - 1
+                }
             });
 
-        let node_color = pipes[node_col].1;
-        let num_cols_before = pipes.len();
-        let mut next_pipes: Vec<(git2::Oid, usize)> = Vec::new();
+        let node_color = pipes[node_col].unwrap().1;
+
         let mut lines: Vec<(usize, usize, usize)> = Vec::new();
 
-        // Continue all other lanes (keep their color)
-        for (col, &(pipe_oid, pipe_color)) in pipes.iter().enumerate() {
-            if col == node_col {
-                continue;
-            }
-            let next_col = next_pipes.len();
-            next_pipes.push((pipe_oid, pipe_color));
-            lines.push((col, next_col, pipe_color));
-        }
+        // Clear the node's slot
+        pipes[node_col] = None;
 
-        // Insert parents
+        // First parent takes the node's slot (same column, same color)
         let mut first_parent = true;
         for parent_oid in &commit.parents {
             if !oid_set.contains(parent_oid) {
                 continue;
             }
-            if let Some(existing) = next_pipes.iter().position(|p| p.0 == *parent_oid) {
-                // Merge into existing lane
-                lines.push((node_col, existing, node_color));
+
+            // Check if parent is already tracked in a different lane
+            let existing = pipes
+                .iter()
+                .position(|p| p.is_some_and(|(oid, _)| oid == *parent_oid));
+
+            if let Some(existing_col) = existing {
+                // Merge: draw line from node to existing lane
+                lines.push((node_col, existing_col, node_color));
+            } else if first_parent {
+                // First parent: reuse the node's column
+                pipes[node_col] = Some((*parent_oid, node_color));
+                lines.push((node_col, node_col, node_color));
             } else {
-                // New lane for this parent
-                let parent_color = if first_parent { node_color } else { next_color };
-                if !first_parent {
-                    next_color += 1;
-                }
-                let target_col = if first_parent {
-                    let insert_pos = node_col.min(next_pipes.len());
-                    next_pipes.insert(insert_pos, (*parent_oid, parent_color));
-                    for line in &mut lines {
-                        if line.1 >= insert_pos {
-                            line.1 += 1;
-                        }
-                    }
-                    insert_pos
+                // Additional parent: find empty slot or append
+                let color = next_color;
+                next_color += 1;
+                let col = if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
+                    pipes[pos] = Some((*parent_oid, color));
+                    pos
                 } else {
-                    next_pipes.push((*parent_oid, parent_color));
-                    next_pipes.len() - 1
+                    pipes.push(Some((*parent_oid, color)));
+                    pipes.len() - 1
                 };
-                lines.push((node_col, target_col, parent_color));
-                first_parent = false;
+                lines.push((node_col, col, color));
             }
-            if first_parent {
-                first_parent = false;
+            first_parent = false;
+        }
+
+        // All other active lanes continue straight
+        for (col, pipe) in pipes.iter().enumerate() {
+            if col == node_col {
+                continue; // already handled above
+            }
+            if let Some((_, color)) = pipe {
+                lines.push((col, col, *color));
             }
         }
 
+        let num_cols = pipes.len();
         rows.push(GraphRow {
             node_col,
+            node_color,
             lines,
-            num_cols: num_cols_before.max(next_pipes.len()),
+            num_cols,
         });
-        pipes = next_pipes;
+
+        // Trim trailing empty slots
+        while pipes.last() == Some(&None) {
+            pipes.pop();
+        }
     }
     rows
 }
@@ -835,7 +850,7 @@ impl eframe::App for GitkApp {
                         painter.circle_filled(
                             egui::pos2(gx(gr.node_col), y_center),
                             dot_radius,
-                            graph_color(gr.node_col),
+                            graph_color(gr.node_color),
                         );
 
                         // ── Text ──
