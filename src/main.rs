@@ -24,6 +24,9 @@ enum RefKind {
 }
 
 fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
+    // Precompute ref map: OID → [(name, kind)] — O(refs) instead of O(commits × refs)
+    let ref_map = build_ref_map(repo);
+
     let mut revwalk = match repo.revwalk() {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -44,7 +47,7 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
             continue;
         }
         if let Ok(commit) = repo.find_commit(oid) {
-            let refs = collect_refs(repo, oid);
+            let refs = ref_map.get(&oid).cloned().unwrap_or_default();
             commits.push(CommitInfo {
                 oid,
                 summary: commit.summary().unwrap_or("").to_string(),
@@ -61,33 +64,43 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
     commits
 }
 
-fn collect_refs(repo: &Repository, oid: git2::Oid) -> Vec<(String, RefKind)> {
-    let mut refs = Vec::new();
+fn build_ref_map(
+    repo: &Repository,
+) -> std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>> {
+    let mut map: std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>> =
+        std::collections::HashMap::new();
+    let head_oid = repo.head().ok().and_then(|h| h.target());
+
     if let Ok(references) = repo.references() {
         for reference in references.flatten() {
-            if reference.target() == Some(oid) {
-                if let Some(shorthand) = reference.shorthand() {
-                    let name = reference.name().unwrap_or("");
-                    let kind = if name.starts_with("refs/tags/") {
-                        RefKind::Tag
-                    } else if name.starts_with("refs/remotes/") {
-                        RefKind::Remote
-                    } else if name.starts_with("refs/heads/") {
-                        RefKind::Branch
-                    } else {
-                        continue;
-                    };
-                    refs.push((shorthand.to_string(), kind));
-                }
-            }
+            let Some(oid) = reference.target() else {
+                continue;
+            };
+            let Some(shorthand) = reference.shorthand() else {
+                continue;
+            };
+            let name = reference.name().unwrap_or("");
+            let kind = if name.starts_with("refs/tags/") {
+                RefKind::Tag
+            } else if name.starts_with("refs/remotes/") {
+                RefKind::Remote
+            } else if name.starts_with("refs/heads/") {
+                RefKind::Branch
+            } else {
+                continue;
+            };
+            map.entry(oid)
+                .or_default()
+                .push((shorthand.to_string(), kind));
         }
     }
-    if let Ok(head) = repo.head() {
-        if head.target() == Some(oid) {
-            refs.insert(0, ("HEAD".to_string(), RefKind::Head));
+    if let Some(head_oid) = head_oid {
+        let entry = map.entry(head_oid).or_default();
+        if !entry.iter().any(|(n, _)| n == "HEAD") {
+            entry.insert(0, ("HEAD".to_string(), RefKind::Head));
         }
     }
-    refs
+    map
 }
 
 // ── Diff data ────────────────────────────────────────────────────────────
@@ -482,9 +495,10 @@ struct GitkApp {
     diff_scroll_to: Option<usize>,
     repo_path: String,
     search_text: String,
-    search_matches: Vec<usize>, // indices into commits
-    search_cursor: usize,       // which match we're on (for Enter cycling)
+    search_matches: Vec<usize>,
+    search_cursor: usize,
     copied_toast: Option<std::time::Instant>,
+    all_loaded: bool,
 }
 
 impl GitkApp {
@@ -499,21 +513,31 @@ impl GitkApp {
         cc.egui_ctx.set_style(style);
 
         let repo = Repository::discover(&repo_path).expect("Not a git repository");
-        let commits = load_commits(&repo, 2000);
+        let commits = load_commits(&repo, 200);
         let graph_rows = layout_graph(&commits);
+
+        // Auto-select first commit and load its diff
+        let (diff_lines, diff_files) = if let Some(first) = commits.first() {
+            let data = get_diff_data(&repo, first.oid);
+            (data.lines, data.files)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let all_loaded = commits.len() < 200;
 
         Self {
             commits,
             graph_rows,
-            selected: None,
-            diff_lines: Vec::new(),
-            diff_files: Vec::new(),
+            selected: Some(0),
+            diff_lines,
+            diff_files,
             diff_scroll_to: None,
             repo_path,
             search_text: String::new(),
             search_matches: Vec::new(),
             search_cursor: 0,
             copied_toast: None,
+            all_loaded,
         }
     }
 }
@@ -641,7 +665,9 @@ impl eframe::App for GitkApp {
                             let mut scroll = egui::ScrollArea::both().id_salt("diff_scroll");
 
                             if let Some(target_line) = self.diff_scroll_to.take() {
-                                let target_y = target_line as f32 * 16.0;
+                                // Line height = font size + item spacing
+                                let line_height = 13.0 + ui.spacing().item_spacing.y;
+                                let target_y = target_line as f32 * line_height;
                                 scroll = scroll.vertical_scroll_offset(target_y);
                             }
 
@@ -1033,6 +1059,15 @@ impl eframe::App for GitkApp {
                     let remaining = total_height - drawn_bottom;
                     if remaining > 0.0 {
                         ui.allocate_space(egui::vec2(0.0, remaining));
+                    }
+
+                    // Lazy load: when near the bottom, load more commits
+                    if !self.all_loaded && last_row + 50 >= num_commits {
+                        let repo = Repository::discover(&self.repo_path).unwrap();
+                        let more = load_commits(&repo, self.commits.len() + 500);
+                        self.all_loaded = more.len() <= self.commits.len();
+                        self.commits = more;
+                        self.graph_rows = layout_graph(&self.commits);
                     }
                 });
         });
