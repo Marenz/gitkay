@@ -507,6 +507,43 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
     DiffData { lines, files }
 }
 
+/// Compute the set of commit indices on the same first-parent chain as `start_idx`.
+/// Walks upward (children via first-parent) and downward (first parent).
+fn compute_branch_highlight(commits: &[CommitInfo], start_idx: usize) -> HashSet<usize> {
+    let mut highlighted = HashSet::new();
+    highlighted.insert(start_idx);
+
+    // Build first-parent child map: parent_oid → child index
+    let mut first_child_of: std::collections::HashMap<git2::Oid, usize> =
+        std::collections::HashMap::new();
+    for (i, c) in commits.iter().enumerate() {
+        if let Some(first_parent) = c.parents.first() {
+            // Only record the first child we encounter (topologically latest)
+            first_child_of.entry(*first_parent).or_insert(i);
+        }
+    }
+
+    // Walk downward: follow first parent
+    let mut idx = start_idx;
+    while let Some(first_parent) = commits[idx].parents.first() {
+        if let Some(parent_idx) = commits.iter().position(|c| c.oid == *first_parent) {
+            highlighted.insert(parent_idx);
+            idx = parent_idx;
+        } else {
+            break;
+        }
+    }
+
+    // Walk upward: follow first-parent children
+    let mut oid = commits[start_idx].oid;
+    while let Some(&child_idx) = first_child_of.get(&oid) {
+        highlighted.insert(child_idx);
+        oid = commits[child_idx].oid;
+    }
+
+    highlighted
+}
+
 // ── Graph layout ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -736,6 +773,7 @@ struct GitkApp {
     all_loaded: bool,
     needs_reload: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
+    branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
 }
 
 impl GitkApp {
@@ -808,6 +846,7 @@ impl GitkApp {
             all_loaded,
             needs_reload,
             _watcher: watcher,
+            branch_highlight: HashSet::new(),
         }
     }
 }
@@ -1152,6 +1191,8 @@ impl eframe::App for GitkApp {
                                         .text(&sha);
                                 }
                                 self.copied_toast = Some(std::time::Instant::now());
+                                self.branch_highlight =
+                                    compute_branch_highlight(&self.commits, clicked_idx);
                                 let repo = Repository::discover(&self.repo_path).unwrap();
                                 let data = get_diff_data(&repo, commit.oid);
                                 self.diff_lines = data.lines;
@@ -1176,6 +1217,31 @@ impl eframe::App for GitkApp {
 
                         let is_search_match = !self.search_matches.is_empty()
                             && self.search_matches.binary_search(&idx).is_ok();
+                        let is_uncommitted = commit.oid == oid_uncommitted();
+                        let is_staged = commit.oid == oid_staged();
+                        let is_branch_member = self.branch_highlight.contains(&idx);
+
+                        // Row background layers: branch → virtual → selection/search/hover
+                        if is_branch_member && self.selected != Some(idx) {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 8),
+                            );
+                        }
+                        if is_uncommitted {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(243, 139, 168, 18),
+                            );
+                        } else if is_staged {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(166, 227, 161, 18),
+                            );
+                        }
 
                         if self.selected == Some(idx) {
                             painter.rect_filled(
