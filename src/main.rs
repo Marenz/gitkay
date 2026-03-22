@@ -363,40 +363,37 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
         // the parent's own row.
         let mut first_parent = true;
         for parent_oid in &commit.parents {
-            if !oid_set.contains(parent_oid) {
-                continue;
-            }
+            let in_scope = oid_set.contains(parent_oid);
 
             // Check if parent is already tracked in a different lane
-            let existing = pipes
-                .iter()
-                .position(|p| p.is_some_and(|(oid, _)| oid == *parent_oid));
+            let existing = if in_scope {
+                pipes
+                    .iter()
+                    .position(|p| p.is_some_and(|(oid, _)| oid == *parent_oid))
+            } else {
+                None
+            };
 
             if first_parent {
+                // First parent always continues in the node's column.
+                // Even if parent is out of scope (not loaded yet), draw
+                // the continuation line so the graph doesn't show an orphan.
                 if let Some(existing_col) = existing {
                     if existing_col == node_col {
-                        // Parent is in our own column (shouldn't happen but handle it)
                         lines.push((node_col, node_col, node_color));
                     } else {
-                        // Parent is tracked in another lane. Keep our lane going
-                        // toward the parent — the duplicate will be resolved when
-                        // the parent commit is processed (it will find two lanes
-                        // pointing to it and pick one).
                         pipes[node_col] = Some((*parent_oid, node_color));
                         lines.push((node_col, node_col, node_color));
                     }
                 } else {
-                    // Parent not tracked yet — claim the node's column
                     pipes[node_col] = Some((*parent_oid, node_color));
                     lines.push((node_col, node_col, node_color));
                 }
-            } else {
-                // Second+ parent
+            } else if in_scope {
+                // Second+ parent (in scope)
                 if let Some(existing_col) = existing {
-                    // Merge: draw line from node to existing lane
                     lines.push((node_col, existing_col, node_color));
                 } else {
-                    // Additional parent: find empty slot or append
                     let color = next_color;
                     next_color += 1;
                     let col = if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
@@ -410,6 +407,7 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
                     new_lanes.push(col);
                 }
             }
+            // Second+ parent out of scope: skip (can't draw merge to unknown)
             first_parent = false;
         }
 
@@ -1627,6 +1625,26 @@ mod tests {
         assert!(
             !has_vertical,
             "Newly created merge lane (col {new_lane_col}) should not have vertical — nothing feeds it from above"
+        );
+    }
+
+    #[test]
+    fn test_parent_not_in_scope_still_has_line() {
+        // When a commit's parent is not in the loaded set,
+        // the commit should still have a downward continuation
+        // line (not appear as an orphan dot).
+        // Commit 1's parent (2) is NOT in the list.
+        let commits = vec![commit(1, &[2])];
+        let rows = layout_graph(&commits);
+
+        // Should have a continuation line downward
+        let has_continuation = rows[0]
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == rows[0].node_col && t == rows[0].node_col);
+        assert!(
+            has_continuation,
+            "Commit with out-of-scope parent should still have a continuation line"
         );
     }
 
