@@ -1,7 +1,10 @@
 use arboard::SetExtLinux;
 use eframe::egui;
 use git2::{DiffOptions, Repository, Sort};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -522,6 +525,8 @@ struct GitkApp {
     search_cursor: usize,
     copied_toast: Option<std::time::Instant>,
     all_loaded: bool,
+    needs_reload: Arc<AtomicBool>,
+    _watcher: Option<RecommendedWatcher>,
 }
 
 impl GitkApp {
@@ -548,6 +553,37 @@ impl GitkApp {
         };
         let all_loaded = commits.len() < 200;
 
+        // Watch .git directory for changes (refs, HEAD, index)
+        let needs_reload = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let needs_reload = needs_reload.clone();
+            let ctx = cc.egui_ctx.clone();
+            let git_dir = repo.path().to_path_buf();
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res {
+                        use notify::EventKind::*;
+                        match event.kind {
+                            Create(_) | Modify(_) | Remove(_) => {
+                                needs_reload.store(true, Ordering::Relaxed);
+                                ctx.request_repaint();
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .ok();
+            if let Some(ref mut w) = watcher {
+                // Watch refs (branches, tags, remotes)
+                let _ = w.watch(&git_dir.join("refs"), RecursiveMode::Recursive);
+                // Watch HEAD (checkout, rebase)
+                let _ = w.watch(&git_dir.join("HEAD"), RecursiveMode::NonRecursive);
+                // Watch index (staging changes)
+                let _ = w.watch(&git_dir.join("index"), RecursiveMode::NonRecursive);
+            }
+            watcher
+        };
+
         Self {
             commits,
             graph_rows,
@@ -561,12 +597,48 @@ impl GitkApp {
             search_cursor: 0,
             copied_toast: None,
             all_loaded,
+            needs_reload,
+            _watcher: watcher,
         }
     }
 }
 
 impl eframe::App for GitkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Auto-reload when git refs change
+        if self.needs_reload.swap(false, Ordering::Relaxed) {
+            if let Ok(repo) = Repository::discover(&self.repo_path) {
+                let count = self.commits.len().max(200);
+                self.commits = load_commits(&repo, count);
+                self.graph_rows = layout_graph(&self.commits);
+                self.all_loaded = self.commits.len() < count;
+                // Re-apply search
+                if !self.search_text.is_empty() {
+                    let q = self.search_text.to_lowercase();
+                    self.search_matches = self
+                        .commits
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            c.summary.to_lowercase().contains(&q)
+                                || c.author.to_lowercase().contains(&q)
+                                || c.oid.to_string().starts_with(&q)
+                                || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                }
+                // Reload diff if a commit is selected
+                if let Some(sel) = self.selected {
+                    if sel < self.commits.len() {
+                        let data = get_diff_data(&repo, self.commits[sel].oid);
+                        self.diff_lines = data.lines;
+                        self.diff_files = data.files;
+                    }
+                }
+            }
+        }
+
         let row_height = 20.0;
         let col_width = 12.0;
         let dot_radius = 3.5;
