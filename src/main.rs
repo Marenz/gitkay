@@ -405,8 +405,11 @@ struct GitkApp {
     selected: Option<usize>,
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
-    diff_scroll_to: Option<usize>, // line index to scroll to
+    diff_scroll_to: Option<usize>,
     repo_path: String,
+    search_text: String,
+    search_matches: Vec<usize>, // indices into commits
+    copied_toast: Option<std::time::Instant>,
 }
 
 impl GitkApp {
@@ -432,6 +435,9 @@ impl GitkApp {
             diff_files: Vec::new(),
             diff_scroll_to: None,
             repo_path,
+            search_text: String::new(),
+            search_matches: Vec::new(),
+            copied_toast: None,
         }
     }
 }
@@ -442,6 +448,55 @@ impl eframe::App for GitkApp {
         let col_width = 12.0;
         let dot_radius = 3.5;
         let max_graph_cols = 20;
+
+        // ── Top panel: search bar ──
+        egui::TopBottomPanel::top("search_panel")
+            .exact_height(28.0)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(egui::RichText::new("🔍").size(14.0));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_text)
+                            .desired_width(300.0)
+                            .hint_text("Search SHA, author, message...")
+                            .font(egui::FontId::monospace(13.0)),
+                    );
+                    if resp.changed() {
+                        let q = self.search_text.to_lowercase();
+                        if q.is_empty() {
+                            self.search_matches.clear();
+                        } else {
+                            self.search_matches = self
+                                .commits
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| {
+                                    c.summary.to_lowercase().contains(&q)
+                                        || c.author.to_lowercase().contains(&q)
+                                        || c.oid.to_string().starts_with(&q)
+                                        || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+                        }
+                    }
+                    if !self.search_matches.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{} matches", self.search_matches.len()))
+                                .color(SUBTEXT)
+                                .size(12.0),
+                        );
+                    }
+                    // Copied toast
+                    if let Some(t) = self.copied_toast {
+                        if t.elapsed().as_secs_f32() < 2.0 {
+                            ui.label(egui::RichText::new("SHA copied!").color(GREEN).size(12.0));
+                        } else {
+                            self.copied_toast = None;
+                        }
+                    }
+                });
+            });
 
         // ── Bottom panel: diff view + file list ──
         egui::TopBottomPanel::bottom("diff_panel")
@@ -459,18 +514,21 @@ impl eframe::App for GitkApp {
                 ui.add_space(2.0);
 
                 ui.horizontal_top(|ui| {
-                    // Compute sidebar width based on content
+                    // Sidebar width driven by file names + stats
                     let sidebar_width = if self.diff_files.is_empty() {
-                        60.0
+                        0.0
                     } else {
-                        let max_name_len = self
+                        let max_entry_len = self
                             .diff_files
                             .iter()
-                            .map(|f| f.path.rsplit('/').next().unwrap_or(&f.path).len())
+                            .map(|f| {
+                                let name_len = f.path.rsplit('/').next().unwrap_or(&f.path).len();
+                                let stat_len = format!("+{} -{}", f.additions, f.deletions).len();
+                                name_len + stat_len + 2
+                            })
                             .max()
-                            .unwrap_or(8);
-                        // ~7px per char + stat labels + padding
-                        ((max_name_len as f32 * 7.5) + 80.0).clamp(120.0, 300.0)
+                            .unwrap_or(10);
+                        ((max_entry_len as f32 * 7.5) + 30.0).clamp(140.0, 280.0)
                     };
 
                     // Left: diff content (scrollable)
@@ -544,9 +602,28 @@ impl eframe::App for GitkApp {
                                             );
                                         }
 
-                                        // Stat indicators
-                                        let mut x = rect.min.x + 2.0;
+                                        let mut x = rect.min.x + 4.0;
                                         let cy = rect.center().y;
+
+                                        // File name first
+                                        let name_color = if resp.hovered() {
+                                            egui::Color32::from_rgb(220, 224, 252)
+                                        } else {
+                                            TEXT
+                                        };
+                                        let ng = ui.painter().layout_no_wrap(
+                                            short_path.to_string(),
+                                            egui::FontId::monospace(12.0),
+                                            name_color,
+                                        );
+                                        ui.painter().galley(
+                                            egui::pos2(x, cy - 7.0),
+                                            ng.clone(),
+                                            name_color,
+                                        );
+                                        x += ng.size().x + 6.0;
+
+                                        // Then stats
                                         if file.additions > 0 {
                                             let g = ui.painter().layout_no_wrap(
                                                 format!("+{}", file.additions),
@@ -571,25 +648,7 @@ impl eframe::App for GitkApp {
                                                 g.clone(),
                                                 RED,
                                             );
-                                            x += g.size().x + 3.0;
                                         }
-
-                                        // File name
-                                        let name_color = if resp.hovered() {
-                                            egui::Color32::from_rgb(220, 224, 252)
-                                        } else {
-                                            TEXT
-                                        };
-                                        let ng = ui.painter().layout_no_wrap(
-                                            short_path.to_string(),
-                                            egui::FontId::monospace(12.0),
-                                            name_color,
-                                        );
-                                        ui.painter().galley(
-                                            egui::pos2(x + 4.0, cy - 7.0),
-                                            ng,
-                                            name_color,
-                                        );
 
                                         if resp.clicked() {
                                             self.diff_scroll_to = Some(line_idx);
@@ -644,15 +703,19 @@ impl eframe::App for GitkApp {
                     );
                     let top_left = response.rect.min;
 
-                    // Check click
+                    // Check click — select commit and copy SHA
                     if response.clicked() {
                         if let Some(pos) = response.interact_pointer_pos() {
                             let row_offset = ((pos.y - top_left.y) / row_height) as usize;
                             let clicked_idx = row_range.start + row_offset;
                             if clicked_idx < num_commits {
                                 self.selected = Some(clicked_idx);
+                                let commit = &self.commits[clicked_idx];
+                                // Copy SHA to clipboard
+                                ctx.copy_text(commit.oid.to_string());
+                                self.copied_toast = Some(std::time::Instant::now());
                                 let repo = Repository::discover(&self.repo_path).unwrap();
-                                let data = get_diff_data(&repo, self.commits[clicked_idx].oid);
+                                let data = get_diff_data(&repo, commit.oid);
                                 self.diff_lines = data.lines;
                                 self.diff_files = data.files;
                             }
@@ -673,11 +736,20 @@ impl eframe::App for GitkApp {
                             egui::vec2(response.rect.width(), row_height),
                         );
 
+                        let is_search_match = !self.search_matches.is_empty()
+                            && self.search_matches.binary_search(&idx).is_ok();
+
                         if self.selected == Some(idx) {
                             painter.rect_filled(
                                 row_rect,
                                 0.0,
                                 egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
+                            );
+                        } else if is_search_match {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(249, 226, 175, 18),
                             );
                         } else if response.hover_pos().is_some_and(|p| row_rect.contains(p)) {
                             painter.rect_filled(
@@ -703,18 +775,33 @@ impl eframe::App for GitkApp {
                             }
                         }
 
-                        // Incoming line (top → dot)
+                        // Incoming lines (top → dot)
+                        // Draw from each source in the previous row that targets our node_col
                         if idx > 0 {
                             let prev = &self.graph_rows[idx - 1];
-                            if prev.lines.iter().any(|&(_, to, _)| to == gr.node_col) {
-                                let c = graph_color(gr.node_col).linear_multiply(0.7);
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(gx(gr.node_col), y_top),
-                                        egui::pos2(gx(gr.node_col), y_center - dot_radius),
-                                    ],
-                                    egui::Stroke::new(2.0, c),
-                                );
+                            for &(from, to, color_col) in &prev.lines {
+                                if to == gr.node_col {
+                                    let c = graph_color(color_col).linear_multiply(0.7);
+                                    if from == to {
+                                        // Straight down into dot
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(gx(gr.node_col), y_top),
+                                                egui::pos2(gx(gr.node_col), y_center - dot_radius),
+                                            ],
+                                            egui::Stroke::new(2.0, c),
+                                        );
+                                    } else {
+                                        // Diagonal from previous row's source into our dot
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(gx(from), y_top),
+                                                egui::pos2(gx(gr.node_col), y_center - dot_radius),
+                                            ],
+                                            egui::Stroke::new(2.0, c),
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -788,19 +875,7 @@ impl eframe::App for GitkApp {
                             cursor_x += label_w + 4.0;
                         }
 
-                        // Summary
-                        let summary_galley = painter.layout_no_wrap(
-                            commit.summary.clone(),
-                            egui::FontId::monospace(13.0),
-                            TEXT,
-                        );
-                        painter.galley(
-                            egui::pos2(cursor_x + 4.0, y_center - 7.0),
-                            summary_galley,
-                            TEXT,
-                        );
-
-                        // Author + date (right-aligned)
+                        // Author + date (right-aligned) — compute first to know where summary must stop
                         let right_x = row_rect.max.x;
                         let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
                             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
@@ -809,20 +884,40 @@ impl eframe::App for GitkApp {
                         let date_galley =
                             painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
                         let date_w = date_galley.size().x;
-                        painter.galley(
-                            egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
-                            date_galley,
-                            SUBTEXT,
-                        );
 
                         let a_color = author_color(&commit.author);
                         let author_galley =
                             painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
                         let author_w = author_galley.size().x;
+
+                        let author_date_x = right_x - date_w - author_w - 28.0;
+
+                        // Summary — truncate to available space before author
+                        let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
+                        let summary_font = egui::FontId::monospace(13.0);
+                        let summary_galley =
+                            painter.layout_no_wrap(commit.summary.clone(), summary_font, TEXT);
+                        // Clip to not overflow into author/date
+                        let summary_clip = egui::Rect::from_min_max(
+                            egui::pos2(cursor_x + 4.0, y_top),
+                            egui::pos2(cursor_x + 4.0 + summary_max_w, y_bottom),
+                        );
+                        painter.with_clip_rect(summary_clip).galley(
+                            egui::pos2(cursor_x + 4.0, y_center - 7.0),
+                            summary_galley,
+                            TEXT,
+                        );
+
+                        // Draw author + date
                         painter.galley(
-                            egui::pos2(right_x - date_w - author_w - 20.0, y_center - 7.0),
+                            egui::pos2(author_date_x, y_center - 7.0),
                             author_galley,
                             a_color,
+                        );
+                        painter.galley(
+                            egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
+                            date_galley,
+                            SUBTEXT,
                         );
                     }
 
