@@ -26,13 +26,80 @@ enum RefKind {
     Tag,
 }
 
-fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
-    // Precompute ref map: OID → [(name, kind)] — O(refs) instead of O(commits × refs)
-    let ref_map = build_ref_map(repo);
+/// Sentinel OID for the "uncommitted changes" virtual entry.
+fn oid_uncommitted() -> git2::Oid {
+    git2::Oid::from_bytes(&[0xFF; 20]).unwrap()
+}
 
+/// Sentinel OID for the "staged changes" virtual entry.
+fn oid_staged() -> git2::Oid {
+    git2::Oid::from_bytes(&[0xFE; 20]).unwrap()
+}
+
+fn is_virtual_oid(oid: git2::Oid) -> bool {
+    oid == oid_uncommitted() || oid == oid_staged()
+}
+
+fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
+    let ref_map = build_ref_map(repo);
+    let head_oid = repo.head().ok().and_then(|h| h.target());
+
+    let mut commits = Vec::new();
+
+    // Check for staged changes (index vs HEAD)
+    let has_staged = repo
+        .diff_index_to_workdir(None, None)
+        .ok()
+        .is_some_and(|_| {
+            // Actually: staged = index vs HEAD tree
+            if let Some(head) = head_oid {
+                if let Ok(head_commit) = repo.find_commit(head) {
+                    if let Ok(head_tree) = head_commit.tree() {
+                        if let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None) {
+                            return diff.deltas().len() > 0;
+                        }
+                    }
+                }
+            }
+            false
+        });
+
+    // Check for uncommitted changes (workdir vs index)
+    let has_uncommitted = repo
+        .diff_index_to_workdir(None, None)
+        .ok()
+        .is_some_and(|diff| diff.deltas().len() > 0);
+
+    // Add virtual entries at the top
+    if has_uncommitted {
+        commits.push(CommitInfo {
+            oid: oid_uncommitted(),
+            summary: "Uncommitted changes".to_string(),
+            author: String::new(),
+            time: chrono::Utc::now().timestamp(),
+            parents: if has_staged {
+                vec![oid_staged()]
+            } else {
+                head_oid.into_iter().collect()
+            },
+            refs: vec![("working tree".to_string(), RefKind::Head)],
+        });
+    }
+    if has_staged {
+        commits.push(CommitInfo {
+            oid: oid_staged(),
+            summary: "Staged changes".to_string(),
+            author: String::new(),
+            time: chrono::Utc::now().timestamp(),
+            parents: head_oid.into_iter().collect(),
+            refs: vec![("index".to_string(), RefKind::Tag)],
+        });
+    }
+
+    // Load real commits
     let mut revwalk = match repo.revwalk() {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return commits,
     };
     revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).ok();
     revwalk.push_head().ok();
@@ -43,7 +110,6 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
             }
         }
     }
-    let mut commits = Vec::new();
     let mut seen = HashSet::new();
     for oid in revwalk.flatten() {
         if !seen.insert(oid) {
@@ -149,6 +215,14 @@ struct DiffData {
 }
 
 fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
+    // Handle virtual entries
+    if oid == oid_uncommitted() {
+        return get_working_tree_diff(repo);
+    }
+    if oid == oid_staged() {
+        return get_staged_diff(repo);
+    }
+
     let commit = match repo.find_commit(oid) {
         Ok(c) => c,
         Err(_) => {
@@ -236,6 +310,141 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
     let mut current_file_idx: Option<usize> = None;
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         // Detect file boundary
+        let delta_path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+
+        if current_file_idx.is_none()
+            || files
+                .get(current_file_idx.unwrap())
+                .is_none_or(|f| f.path != delta_path)
+        {
+            current_file_idx = files.iter().position(|f| f.path == delta_path);
+            if let Some(fi) = current_file_idx {
+                files[fi].diff_line_idx = lines.len();
+            }
+        }
+
+        let kind = match line.origin() {
+            '+' => {
+                if let Some(fi) = current_file_idx {
+                    files[fi].additions += 1;
+                }
+                LineKind::Add
+            }
+            '-' => {
+                if let Some(fi) = current_file_idx {
+                    files[fi].deletions += 1;
+                }
+                LineKind::Del
+            }
+            'H' | 'F' => LineKind::Hunk,
+            _ => {
+                let content = std::str::from_utf8(line.content()).unwrap_or("");
+                if content.starts_with("diff ") || content.starts_with("index ") {
+                    LineKind::FileMeta
+                } else if content.starts_with("--- ") || content.starts_with("+++ ") {
+                    LineKind::FileName
+                } else if content.starts_with("@@") {
+                    LineKind::Hunk
+                } else {
+                    LineKind::Context
+                }
+            }
+        };
+        let prefix = match line.origin() {
+            '+' => "+",
+            '-' => "-",
+            _ => "",
+        };
+        let content = std::str::from_utf8(line.content()).unwrap_or("");
+        lines.push(DiffLine::new(
+            &format!("{prefix}{}", content.trim_end_matches('\n')),
+            kind,
+        ));
+        true
+    })
+    .ok();
+
+    DiffData { lines, files }
+}
+
+/// Generate diff for uncommitted working tree changes (workdir vs index).
+fn get_working_tree_diff(repo: &Repository) -> DiffData {
+    let diff = match repo.diff_index_to_workdir(None, None) {
+        Ok(d) => d,
+        Err(_) => {
+            return DiffData {
+                lines: Vec::new(),
+                files: Vec::new(),
+            }
+        }
+    };
+    diff_to_data(&diff, "Uncommitted changes (working tree)")
+}
+
+/// Generate diff for staged changes (index vs HEAD).
+fn get_staged_diff(repo: &Repository) -> DiffData {
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .and_then(|c| c.tree().ok());
+    let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+        Ok(d) => d,
+        Err(_) => {
+            return DiffData {
+                lines: Vec::new(),
+                files: Vec::new(),
+            }
+        }
+    };
+    diff_to_data(&diff, "Staged changes (index)")
+}
+
+/// Convert a git2::Diff into our DiffData format.
+fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
+    let mut lines = Vec::new();
+    let mut files = Vec::new();
+
+    lines.push(DiffLine::new(title, LineKind::Meta));
+    lines.push(DiffLine::new("", LineKind::Context));
+
+    // Collect file stats
+    for i in 0..diff.deltas().len() {
+        if let Some(delta) = diff.get_delta(i) {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+            files.push(FileEntry {
+                path,
+                additions: 0,
+                deletions: 0,
+                diff_line_idx: 0,
+            });
+        }
+    }
+
+    // Stats
+    if let Ok(stats) = diff.stats() {
+        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
+            for l in s.as_str().unwrap_or("").lines() {
+                lines.push(DiffLine::new(l, LineKind::Stat));
+            }
+        }
+    }
+    lines.push(DiffLine::new("", LineKind::Context));
+
+    // Patch
+    let mut current_file_idx: Option<usize> = None;
+    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let delta_path = delta
             .new_file()
             .path()
