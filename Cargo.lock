@@ -1268,6 +1268,7 @@ dependencies = [
 name = "gitkview"
 version = "0.2.0"
 dependencies = [
+ "arboard",
  "chrono",
  "eframe",
  "egui",

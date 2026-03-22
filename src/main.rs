@@ -1,3 +1,4 @@
+use arboard::SetExtLinux;
 use eframe::egui;
 use git2::{DiffOptions, Repository, Sort};
 use std::collections::HashSet;
@@ -482,6 +483,7 @@ struct GitkApp {
     repo_path: String,
     search_text: String,
     search_matches: Vec<usize>, // indices into commits
+    search_cursor: usize,       // which match we're on (for Enter cycling)
     copied_toast: Option<std::time::Instant>,
 }
 
@@ -497,7 +499,7 @@ impl GitkApp {
         cc.egui_ctx.set_style(style);
 
         let repo = Repository::discover(&repo_path).expect("Not a git repository");
-        let commits = load_commits(&repo, 5000);
+        let commits = load_commits(&repo, 2000);
         let graph_rows = layout_graph(&commits);
 
         Self {
@@ -510,6 +512,7 @@ impl GitkApp {
             repo_path,
             search_text: String::new(),
             search_matches: Vec::new(),
+            search_cursor: 0,
             copied_toast: None,
         }
     }
@@ -528,14 +531,16 @@ impl eframe::App for GitkApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(egui::RichText::new("🔍").size(14.0));
+                    let avail = ui.available_width() - 120.0; // leave space for match count
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_text)
-                            .desired_width(300.0)
+                            .desired_width(avail.max(100.0))
                             .hint_text("Search SHA, author, message...")
                             .font(egui::FontId::monospace(13.0)),
                     );
                     if resp.changed() {
                         let q = self.search_text.to_lowercase();
+                        self.search_cursor = 0;
                         if q.is_empty() {
                             self.search_matches.clear();
                         } else {
@@ -552,12 +557,34 @@ impl eframe::App for GitkApp {
                                 .map(|(i, _)| i)
                                 .collect();
                         }
+                        // Jump to first match
+                        if let Some(&idx) = self.search_matches.first() {
+                            self.selected = Some(idx);
+                        }
+                    }
+                    // Enter cycles through matches
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if !self.search_matches.is_empty() {
+                            self.search_cursor =
+                                (self.search_cursor + 1) % self.search_matches.len();
+                            let idx = self.search_matches[self.search_cursor];
+                            self.selected = Some(idx);
+                            let repo = Repository::discover(&self.repo_path).unwrap();
+                            let data = get_diff_data(&repo, self.commits[idx].oid);
+                            self.diff_lines = data.lines;
+                            self.diff_files = data.files;
+                        }
+                        resp.request_focus();
                     }
                     if !self.search_matches.is_empty() {
                         ui.label(
-                            egui::RichText::new(format!("{} matches", self.search_matches.len()))
-                                .color(SUBTEXT)
-                                .size(12.0),
+                            egui::RichText::new(format!(
+                                "{}/{}",
+                                self.search_cursor + 1,
+                                self.search_matches.len()
+                            ))
+                            .color(SUBTEXT)
+                            .size(12.0),
                         );
                     }
                     // Copied toast
@@ -784,8 +811,16 @@ impl eframe::App for GitkApp {
                             if clicked_idx < num_commits {
                                 self.selected = Some(clicked_idx);
                                 let commit = &self.commits[clicked_idx];
-                                // Copy SHA to clipboard
-                                ctx.copy_text(commit.oid.to_string());
+                                // Copy SHA to both clipboards
+                                let sha = commit.oid.to_string();
+                                ctx.copy_text(sha.clone());
+                                // Also set primary selection (middle-click paste)
+                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    let _ = clip
+                                        .set()
+                                        .clipboard(arboard::LinuxClipboardKind::Primary)
+                                        .text(&sha);
+                                }
                                 self.copied_toast = Some(std::time::Instant::now());
                                 let repo = Repository::discover(&self.repo_path).unwrap();
                                 let data = get_diff_data(&repo, commit.oid);
