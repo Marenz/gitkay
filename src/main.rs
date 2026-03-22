@@ -1,6 +1,6 @@
 use eframe::egui;
 use git2::{DiffOptions, Repository, Sort};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -29,7 +29,6 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
     };
     revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).ok();
     revwalk.push_head().ok();
-
     if let Ok(branches) = repo.branches(None) {
         for branch in branches.flatten() {
             if let Some(oid) = branch.0.get().target() {
@@ -37,10 +36,8 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
             }
         }
     }
-
     let mut commits = Vec::new();
     let mut seen = HashSet::new();
-
     for oid in revwalk.flatten() {
         if !seen.insert(oid) {
             continue;
@@ -92,88 +89,7 @@ fn collect_refs(repo: &Repository, oid: git2::Oid) -> Vec<(String, RefKind)> {
     refs
 }
 
-fn get_diff_text(repo: &Repository, oid: git2::Oid) -> Vec<DiffLine> {
-    let commit = match repo.find_commit(oid) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let tree = match commit.tree() {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-
-    let mut opts = DiffOptions::new();
-    let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut lines = Vec::new();
-
-    // Header
-    lines.push(DiffLine::new(&format!("commit {}", oid), LineKind::Meta));
-    lines.push(DiffLine::new(
-        &format!("Author: {}", commit.author()),
-        LineKind::Meta,
-    ));
-    if let Some(dt) = chrono::DateTime::from_timestamp(commit.time().seconds(), 0) {
-        lines.push(DiffLine::new(
-            &format!("Date:   {}", dt.format("%Y-%m-%d %H:%M:%S")),
-            LineKind::Meta,
-        ));
-    }
-    lines.push(DiffLine::new("", LineKind::Context));
-    if let Some(msg) = commit.message() {
-        for l in msg.lines() {
-            lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
-        }
-    }
-    lines.push(DiffLine::new("", LineKind::Context));
-
-    // Stats
-    if let Ok(stats) = diff.stats() {
-        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
-        }
-    }
-    lines.push(DiffLine::new("", LineKind::Context));
-
-    // Patch
-    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-        let kind = match line.origin() {
-            '+' => LineKind::Add,
-            '-' => LineKind::Del,
-            'H' | 'F' => LineKind::Hunk,
-            _ => {
-                let content = std::str::from_utf8(line.content()).unwrap_or("");
-                if content.starts_with("diff ") || content.starts_with("index ") {
-                    LineKind::FileMeta
-                } else if content.starts_with("--- ") || content.starts_with("+++ ") {
-                    LineKind::FileName
-                } else if content.starts_with("@@") {
-                    LineKind::Hunk
-                } else {
-                    LineKind::Context
-                }
-            }
-        };
-        let prefix = match line.origin() {
-            '+' => "+",
-            '-' => "-",
-            _ => "",
-        };
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
-        let text = format!("{prefix}{}", content.trim_end_matches('\n'));
-        lines.push(DiffLine::new(&text, kind));
-        true
-    })
-    .ok();
-
-    lines
-}
+// ── Diff data ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct DiffLine {
@@ -202,12 +118,174 @@ enum LineKind {
     Stat,
 }
 
+#[derive(Clone)]
+struct FileEntry {
+    path: String,
+    additions: usize,
+    deletions: usize,
+    diff_line_idx: usize, // line index in diff_lines where this file's diff starts
+}
+
+struct DiffData {
+    lines: Vec<DiffLine>,
+    files: Vec<FileEntry>,
+}
+
+fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
+    let commit = match repo.find_commit(oid) {
+        Ok(c) => c,
+        Err(_) => {
+            return DiffData {
+                lines: Vec::new(),
+                files: Vec::new(),
+            }
+        }
+    };
+    let tree = match commit.tree() {
+        Ok(t) => t,
+        Err(_) => {
+            return DiffData {
+                lines: Vec::new(),
+                files: Vec::new(),
+            }
+        }
+    };
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+
+    let mut opts = DiffOptions::new();
+    let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
+        Ok(d) => d,
+        Err(_) => {
+            return DiffData {
+                lines: Vec::new(),
+                files: Vec::new(),
+            }
+        }
+    };
+
+    // Collect file stats
+    let mut files = Vec::new();
+    for i in 0..diff.deltas().len() {
+        if let Some(delta) = diff.get_delta(i) {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+            files.push(FileEntry {
+                path,
+                additions: 0,
+                deletions: 0,
+                diff_line_idx: 0,
+            });
+        }
+    }
+
+    let mut lines = Vec::new();
+
+    // Header
+    lines.push(DiffLine::new(&format!("commit {oid}"), LineKind::Meta));
+    lines.push(DiffLine::new(
+        &format!("Author: {}", commit.author()),
+        LineKind::Meta,
+    ));
+    if let Some(dt) = chrono::DateTime::from_timestamp(commit.time().seconds(), 0) {
+        lines.push(DiffLine::new(
+            &format!("Date:   {}", dt.format("%Y-%m-%d %H:%M:%S")),
+            LineKind::Meta,
+        ));
+    }
+    lines.push(DiffLine::new("", LineKind::Context));
+    if let Some(msg) = commit.message() {
+        for l in msg.lines() {
+            lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
+        }
+    }
+    lines.push(DiffLine::new("", LineKind::Context));
+
+    // Stats
+    if let Ok(stats) = diff.stats() {
+        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
+            for l in s.as_str().unwrap_or("").lines() {
+                lines.push(DiffLine::new(l, LineKind::Stat));
+            }
+        }
+    }
+    lines.push(DiffLine::new("", LineKind::Context));
+
+    // Patch — track which file we're in
+    let mut current_file_idx: Option<usize> = None;
+    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        // Detect file boundary
+        let delta_path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+
+        if current_file_idx.is_none()
+            || files
+                .get(current_file_idx.unwrap())
+                .is_none_or(|f| f.path != delta_path)
+        {
+            current_file_idx = files.iter().position(|f| f.path == delta_path);
+            if let Some(fi) = current_file_idx {
+                files[fi].diff_line_idx = lines.len();
+            }
+        }
+
+        let kind = match line.origin() {
+            '+' => {
+                if let Some(fi) = current_file_idx {
+                    files[fi].additions += 1;
+                }
+                LineKind::Add
+            }
+            '-' => {
+                if let Some(fi) = current_file_idx {
+                    files[fi].deletions += 1;
+                }
+                LineKind::Del
+            }
+            'H' | 'F' => LineKind::Hunk,
+            _ => {
+                let content = std::str::from_utf8(line.content()).unwrap_or("");
+                if content.starts_with("diff ") || content.starts_with("index ") {
+                    LineKind::FileMeta
+                } else if content.starts_with("--- ") || content.starts_with("+++ ") {
+                    LineKind::FileName
+                } else if content.starts_with("@@") {
+                    LineKind::Hunk
+                } else {
+                    LineKind::Context
+                }
+            }
+        };
+        let prefix = match line.origin() {
+            '+' => "+",
+            '-' => "-",
+            _ => "",
+        };
+        let content = std::str::from_utf8(line.content()).unwrap_or("");
+        lines.push(DiffLine::new(
+            &format!("{prefix}{}", content.trim_end_matches('\n')),
+            kind,
+        ));
+        true
+    })
+    .ok();
+
+    DiffData { lines, files }
+}
+
 // ── Graph layout ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct GraphRow {
     node_col: usize,
-    /// (from_col, to_col, color_col)
     lines: Vec<(usize, usize, usize)>,
     num_cols: usize,
 }
@@ -230,7 +308,6 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
         let mut next_pipes: Vec<git2::Oid> = Vec::new();
         let mut lines: Vec<(usize, usize, usize)> = Vec::new();
 
-        // Continue all other lanes
         for (col, &pipe_oid) in pipes.iter().enumerate() {
             if col == node_col {
                 continue;
@@ -240,7 +317,6 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             lines.push((col, next_col, col));
         }
 
-        // Insert parents
         let mut first_parent = true;
         for parent_oid in &commit.parents {
             if !oid_set.contains(parent_oid) {
@@ -279,10 +355,8 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             lines,
             num_cols: num_cols_before.max(next_pipes.len()),
         });
-
         pipes = next_pipes;
     }
-
     rows
 }
 
@@ -304,7 +378,15 @@ fn graph_color(col: usize) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
-// Catppuccin Mocha
+/// Deterministic color for an author name.
+fn author_color(name: &str) -> egui::Color32 {
+    let hash = name
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let (r, g, b) = GRAPH_COLORS[(hash as usize) % GRAPH_COLORS.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
 const BG: egui::Color32 = egui::Color32::from_rgb(30, 30, 46);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(205, 214, 244);
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(108, 112, 134);
@@ -314,7 +396,6 @@ const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const BLUE: egui::Color32 = egui::Color32::from_rgb(137, 180, 250);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
-const TEAL: egui::Color32 = egui::Color32::from_rgb(148, 226, 213);
 
 // ── App state ────────────────────────────────────────────────────────────
 
@@ -323,12 +404,13 @@ struct GitkApp {
     graph_rows: Vec<GraphRow>,
     selected: Option<usize>,
     diff_lines: Vec<DiffLine>,
+    diff_files: Vec<FileEntry>,
+    diff_scroll_to: Option<usize>, // line index to scroll to
     repo_path: String,
 }
 
 impl GitkApp {
     fn new(cc: &eframe::CreationContext<'_>, repo_path: String) -> Self {
-        // Set up dark theme
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
@@ -347,6 +429,8 @@ impl GitkApp {
             graph_rows,
             selected: None,
             diff_lines: Vec::new(),
+            diff_files: Vec::new(),
+            diff_scroll_to: None,
             repo_path,
         }
     }
@@ -359,30 +443,107 @@ impl eframe::App for GitkApp {
         let dot_radius = 3.5;
         let max_graph_cols = 20;
 
-        // Split: top = commit list, bottom = diff
+        // ── Bottom panel: diff view + file list ──
         egui::TopBottomPanel::bottom("diff_panel")
             .resizable(true)
             .min_height(100.0)
             .default_height(300.0)
             .show(ctx, |ui| {
-                ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
-                egui::ScrollArea::both().show(ui, |ui| {
-                    for line in &self.diff_lines {
-                        let color = match line.kind {
-                            LineKind::Add => GREEN,
-                            LineKind::Del => RED,
-                            LineKind::Hunk => BLUE,
-                            LineKind::Meta => MAUVE,
-                            LineKind::FileMeta => MAUVE,
-                            LineKind::FileName => YELLOW,
-                            LineKind::Stat => SUBTEXT,
-                            LineKind::Context => TEXT,
-                        };
-                        ui.colored_label(color, &line.text);
-                    }
+                ui.horizontal_top(|ui| {
+                    // Left: diff content (scrollable)
+                    let diff_width = ui.available_width() - 220.0;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(diff_width.max(200.0), ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
+                            let scroll_id = egui::Id::new("diff_scroll");
+                            let mut scroll = egui::ScrollArea::both().id_salt(scroll_id);
+
+                            // Handle scroll-to-file
+                            if let Some(target_line) = self.diff_scroll_to.take() {
+                                let target_y = target_line as f32 * 16.0;
+                                scroll = scroll.vertical_scroll_offset(target_y);
+                            }
+
+                            scroll.show(ui, |ui| {
+                                for line in &self.diff_lines {
+                                    let color = match line.kind {
+                                        LineKind::Add => GREEN,
+                                        LineKind::Del => RED,
+                                        LineKind::Hunk => BLUE,
+                                        LineKind::Meta => MAUVE,
+                                        LineKind::FileMeta => MAUVE,
+                                        LineKind::FileName => YELLOW,
+                                        LineKind::Stat => SUBTEXT,
+                                        LineKind::Context => TEXT,
+                                    };
+                                    ui.colored_label(color, &line.text);
+                                }
+                            });
+                        },
+                    );
+
+                    ui.separator();
+
+                    // Right: file list
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} files", self.diff_files.len()))
+                                .color(SUBTEXT)
+                                .size(11.0),
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("file_list")
+                            .show(ui, |ui| {
+                                for file in &self.diff_files {
+                                    let short_path =
+                                        file.path.rsplit('/').next().unwrap_or(&file.path);
+                                    let stat = format!("+{} -{}", file.additions, file.deletions);
+                                    let line_idx = file.diff_line_idx;
+
+                                    ui.horizontal(|ui| {
+                                        // Stat indicators
+                                        if file.additions > 0 {
+                                            ui.colored_label(
+                                                GREEN,
+                                                egui::RichText::new(format!("+{}", file.additions))
+                                                    .size(10.0),
+                                            );
+                                        }
+                                        if file.deletions > 0 {
+                                            ui.colored_label(
+                                                RED,
+                                                egui::RichText::new(format!("-{}", file.deletions))
+                                                    .size(10.0),
+                                            );
+                                        }
+
+                                        // Clickable file name with tooltip
+                                        if ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(short_path)
+                                                        .color(TEXT)
+                                                        .size(12.0),
+                                                )
+                                                .sense(egui::Sense::click())
+                                                .truncate(),
+                                            )
+                                            .on_hover_text_at_pointer(&file.path)
+                                            .clicked()
+                                        {
+                                            self.diff_scroll_to = Some(line_idx);
+                                        }
+                                    });
+                                }
+                            });
+                    });
                 });
             });
 
+        // ── Central panel: commit graph + list ──
         egui::CentralPanel::default().show(ctx, |ui| {
             let num_commits = self.commits.len();
             let graph_width = (self
@@ -395,186 +556,201 @@ impl eframe::App for GitkApp {
                 * col_width
                 + 8.0;
 
-            egui::ScrollArea::vertical().show_rows(ui, row_height, num_commits, |ui, row_range| {
-                // Get the paint area for the graph
-                let top_left = ui.cursor().min;
+            let available_height = ui.available_height();
 
-                // Draw all visible rows
-                let painter = ui.painter().clone();
-
-                for idx in row_range.clone() {
-                    let commit = &self.commits[idx];
-                    let gr = &self.graph_rows[idx];
-                    let y_center =
-                        top_left.y + (idx - row_range.start) as f32 * row_height + row_height / 2.0;
-                    let y_top = y_center - row_height / 2.0;
-                    let y_bottom = y_center + row_height / 2.0;
-
-                    // Row background (selection / hover)
-                    let row_rect = egui::Rect::from_min_size(
-                        egui::pos2(top_left.x, y_top),
-                        egui::vec2(ui.available_width(), row_height),
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, num_commits, |ui, row_range| {
+                    // Allocate the full height for all visible rows
+                    let total_height = (row_range.end - row_range.start) as f32 * row_height;
+                    let (response, painter) = ui.allocate_painter(
+                        egui::vec2(ui.available_width(), total_height),
+                        egui::Sense::click(),
                     );
+                    let top_left = response.rect.min;
 
-                    let is_selected = self.selected == Some(idx);
-                    if is_selected {
-                        painter.rect_filled(
-                            row_rect,
-                            0.0,
-                            egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
-                        );
-                    }
-
-                    // Click detection
-                    let response = ui.allocate_rect(row_rect, egui::Sense::click());
+                    // Check click
                     if response.clicked() {
-                        self.selected = Some(idx);
-                        let repo = Repository::discover(&self.repo_path).unwrap();
-                        self.diff_lines = get_diff_text(&repo, commit.oid);
-                    }
-                    if response.hovered() && !is_selected {
-                        painter.rect_filled(
-                            row_rect,
-                            0.0,
-                            egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
-                        );
-                    }
-
-                    let gx = |col: usize| -> f32 {
-                        top_left.x + col as f32 * col_width + col_width / 2.0
-                    };
-
-                    // ── Graph: straight-through lanes ──
-                    for &(from, to, color_col) in &gr.lines {
-                        if from == to && from != gr.node_col {
-                            let x = gx(from);
-                            let c = graph_color(color_col).linear_multiply(0.5);
-                            painter.line_segment(
-                                [egui::pos2(x, y_top), egui::pos2(x, y_bottom)],
-                                egui::Stroke::new(2.0, c),
-                            );
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let row_offset = ((pos.y - top_left.y) / row_height) as usize;
+                            let clicked_idx = row_range.start + row_offset;
+                            if clicked_idx < num_commits {
+                                self.selected = Some(clicked_idx);
+                                let repo = Repository::discover(&self.repo_path).unwrap();
+                                let data = get_diff_data(&repo, self.commits[clicked_idx].oid);
+                                self.diff_lines = data.lines;
+                                self.diff_files = data.files;
+                            }
                         }
                     }
 
-                    // ── Graph: incoming line (top → dot) ──
-                    if idx > 0 {
-                        let prev = &self.graph_rows[idx - 1];
-                        if prev.lines.iter().any(|&(_, to, _)| to == gr.node_col) {
-                            let x = gx(gr.node_col);
+                    for idx in row_range.clone() {
+                        let commit = &self.commits[idx];
+                        let gr = &self.graph_rows[idx];
+                        let row_offset = (idx - row_range.start) as f32;
+                        let y_center = top_left.y + row_offset * row_height + row_height / 2.0;
+                        let y_top = y_center - row_height / 2.0;
+                        let y_bottom = y_center + row_height / 2.0;
+
+                        // Row background
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(top_left.x, y_top),
+                            egui::vec2(response.rect.width(), row_height),
+                        );
+
+                        if self.selected == Some(idx) {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
+                            );
+                        } else if response.hover_pos().is_some_and(|p| row_rect.contains(p)) {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
+                            );
+                        }
+
+                        let gx = |col: usize| -> f32 {
+                            top_left.x + col as f32 * col_width + col_width / 2.0
+                        };
+
+                        // ── Graph ──
+                        // Straight-through lanes
+                        for &(from, to, color_col) in &gr.lines {
+                            if from == to && from != gr.node_col {
+                                let c = graph_color(color_col).linear_multiply(0.5);
+                                painter.line_segment(
+                                    [egui::pos2(gx(from), y_top), egui::pos2(gx(to), y_bottom)],
+                                    egui::Stroke::new(2.0, c),
+                                );
+                            }
+                        }
+
+                        // Incoming line (top → dot)
+                        if idx > 0 {
+                            let prev = &self.graph_rows[idx - 1];
+                            if prev.lines.iter().any(|&(_, to, _)| to == gr.node_col) {
+                                let c = graph_color(gr.node_col).linear_multiply(0.7);
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(gx(gr.node_col), y_top),
+                                        egui::pos2(gx(gr.node_col), y_center - dot_radius),
+                                    ],
+                                    egui::Stroke::new(2.0, c),
+                                );
+                            }
+                        }
+
+                        // Outgoing line (dot → bottom)
+                        if gr
+                            .lines
+                            .iter()
+                            .any(|&(f, t, _)| f == gr.node_col && t == gr.node_col)
+                        {
                             let c = graph_color(gr.node_col).linear_multiply(0.7);
                             painter.line_segment(
-                                [egui::pos2(x, y_top), egui::pos2(x, y_center - dot_radius)],
+                                [
+                                    egui::pos2(gx(gr.node_col), y_center + dot_radius),
+                                    egui::pos2(gx(gr.node_col), y_bottom),
+                                ],
                                 egui::Stroke::new(2.0, c),
                             );
                         }
-                    }
 
-                    // ── Graph: outgoing line (dot → bottom) ──
-                    if gr
-                        .lines
-                        .iter()
-                        .any(|&(f, t, _)| f == gr.node_col && t == gr.node_col)
-                    {
-                        let x = gx(gr.node_col);
-                        let c = graph_color(gr.node_col).linear_multiply(0.7);
-                        painter.line_segment(
-                            [
-                                egui::pos2(x, y_center + dot_radius),
-                                egui::pos2(x, y_bottom),
-                            ],
-                            egui::Stroke::new(2.0, c),
-                        );
-                    }
-
-                    // ── Graph: branch/merge diagonals ──
-                    for &(from, to, color_col) in &gr.lines {
-                        if from != to {
-                            let c = graph_color(color_col).linear_multiply(0.7);
-                            painter.line_segment(
-                                [egui::pos2(gx(from), y_center), egui::pos2(gx(to), y_bottom)],
-                                egui::Stroke::new(2.0, c),
-                            );
+                        // Branch/merge diagonals
+                        for &(from, to, color_col) in &gr.lines {
+                            if from != to {
+                                let c = graph_color(color_col).linear_multiply(0.7);
+                                painter.line_segment(
+                                    [egui::pos2(gx(from), y_center), egui::pos2(gx(to), y_bottom)],
+                                    egui::Stroke::new(2.0, c),
+                                );
+                            }
                         }
-                    }
 
-                    // ── Graph: commit dot ──
-                    let dot_color = graph_color(gr.node_col);
-                    painter.circle_filled(
-                        egui::pos2(gx(gr.node_col), y_center),
-                        dot_radius,
-                        dot_color,
-                    );
-
-                    // ── Text: refs, summary, author, date ──
-                    let text_x = top_left.x + graph_width;
-                    let mut cursor_x = text_x;
-
-                    // Ref labels
-                    for (ref_name, kind) in &commit.refs {
-                        let (bg, fg) = match kind {
-                            RefKind::Head => (
-                                egui::Color32::from_rgba_unmultiplied(243, 139, 168, 80),
-                                RED,
-                            ),
-                            RefKind::Branch => (
-                                egui::Color32::from_rgba_unmultiplied(166, 227, 161, 50),
-                                GREEN,
-                            ),
-                            RefKind::Remote => (
-                                egui::Color32::from_rgba_unmultiplied(137, 180, 250, 50),
-                                BLUE,
-                            ),
-                            RefKind::Tag => (
-                                egui::Color32::from_rgba_unmultiplied(249, 226, 175, 50),
-                                YELLOW,
-                            ),
-                        };
-                        let font = egui::FontId::monospace(11.0);
-                        let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
-                        let label_w = galley.size().x + 10.0;
-                        let label_rect = egui::Rect::from_min_size(
-                            egui::pos2(cursor_x, y_center - 8.0),
-                            egui::vec2(label_w, 16.0),
+                        // Commit dot
+                        painter.circle_filled(
+                            egui::pos2(gx(gr.node_col), y_center),
+                            dot_radius,
+                            graph_color(gr.node_col),
                         );
-                        painter.rect_filled(label_rect, 4.0, bg);
-                        painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
-                        cursor_x += label_w + 4.0;
+
+                        // ── Text ──
+                        let text_x = top_left.x + graph_width;
+                        let mut cursor_x = text_x;
+
+                        // Ref labels
+                        for (ref_name, kind) in &commit.refs {
+                            let (bg, fg) = match kind {
+                                RefKind::Head => (
+                                    egui::Color32::from_rgba_unmultiplied(243, 139, 168, 80),
+                                    RED,
+                                ),
+                                RefKind::Branch => (
+                                    egui::Color32::from_rgba_unmultiplied(166, 227, 161, 50),
+                                    GREEN,
+                                ),
+                                RefKind::Remote => (
+                                    egui::Color32::from_rgba_unmultiplied(137, 180, 250, 50),
+                                    BLUE,
+                                ),
+                                RefKind::Tag => (
+                                    egui::Color32::from_rgba_unmultiplied(249, 226, 175, 50),
+                                    YELLOW,
+                                ),
+                            };
+                            let font = egui::FontId::monospace(11.0);
+                            let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
+                            let label_w = galley.size().x + 10.0;
+                            let label_rect = egui::Rect::from_min_size(
+                                egui::pos2(cursor_x, y_center - 8.0),
+                                egui::vec2(label_w, 16.0),
+                            );
+                            painter.rect_filled(label_rect, 4.0, bg);
+                            painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
+                            cursor_x += label_w + 4.0;
+                        }
+
+                        // Summary
+                        let summary_galley = painter.layout_no_wrap(
+                            commit.summary.clone(),
+                            egui::FontId::monospace(13.0),
+                            TEXT,
+                        );
+                        painter.galley(
+                            egui::pos2(cursor_x + 4.0, y_center - 7.0),
+                            summary_galley,
+                            TEXT,
+                        );
+
+                        // Author + date (right-aligned)
+                        let right_x = row_rect.max.x;
+                        let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default();
+                        let date_font = egui::FontId::monospace(12.0);
+                        let date_galley =
+                            painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
+                        let date_w = date_galley.size().x;
+                        painter.galley(
+                            egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
+                            date_galley,
+                            SUBTEXT,
+                        );
+
+                        let a_color = author_color(&commit.author);
+                        let author_galley =
+                            painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
+                        let author_w = author_galley.size().x;
+                        painter.galley(
+                            egui::pos2(right_x - date_w - author_w - 20.0, y_center - 7.0),
+                            author_galley,
+                            a_color,
+                        );
                     }
-
-                    // Summary
-                    let summary_font = egui::FontId::monospace(13.0);
-                    let summary_galley =
-                        painter.layout_no_wrap(commit.summary.clone(), summary_font, TEXT);
-                    painter.galley(
-                        egui::pos2(cursor_x + 4.0, y_center - 7.0),
-                        summary_galley,
-                        TEXT,
-                    );
-
-                    // Author (right-aligned area)
-                    let right_x = row_rect.max.x;
-                    let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_default();
-                    let date_font = egui::FontId::monospace(12.0);
-                    let date_galley = painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
-                    let date_w = date_galley.size().x;
-                    painter.galley(
-                        egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
-                        date_galley,
-                        SUBTEXT,
-                    );
-
-                    let author_galley =
-                        painter.layout_no_wrap(commit.author.clone(), date_font, TEAL);
-                    let author_w = author_galley.size().x;
-                    painter.galley(
-                        egui::pos2(right_x - date_w - author_w - 20.0, y_center - 7.0),
-                        author_galley,
-                        TEAL,
-                    );
-                }
-            });
+                });
         });
     }
 }
@@ -582,7 +758,6 @@ impl eframe::App for GitkApp {
 fn main() -> eframe::Result {
     let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
 
-    // Verify repo exists before launching UI
     if Repository::discover(&repo_path).is_err() {
         eprintln!("Not a git repository: {repo_path}");
         std::process::exit(1);
