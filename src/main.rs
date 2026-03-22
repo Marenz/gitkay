@@ -338,6 +338,7 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
         }
 
         let mut lines: Vec<(usize, usize, usize)> = Vec::new();
+        let mut new_lanes: Vec<usize> = Vec::new(); // columns created by this commit
 
         // Clear the node's slot
         pipes[node_col] = None;
@@ -392,17 +393,20 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
                         pipes.len() - 1
                     };
                     lines.push((node_col, col, color));
+                    new_lanes.push(col);
                 }
             }
             first_parent = false;
         }
 
-        // All other active lanes continue straight — but skip lanes
-        // that were consumed by convergence (pipe cleared above).
-        // Merge targets that still have an active pipe continue normally
-        // (e.g. main merged into feature — main still has commits below).
+        // All other active lanes continue straight — but skip:
+        // - lanes consumed by convergence (pipe already cleared)
+        // - lanes newly created by this commit's merge (nothing above them)
         for (col, pipe) in pipes.iter().enumerate() {
             if col == node_col {
+                continue;
+            }
+            if new_lanes.contains(&col) {
                 continue;
             }
             if let Some((_, color)) = pipe {
@@ -1325,13 +1329,10 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_target_has_vertical_when_lane_active() {
-        // When a merge commit draws a diagonal to a lane that still has
-        // future commits, the lane should ALSO continue vertically.
-        // 1 (merge: 2, 3)
-        // 2 (parent: 4)
-        // 3 (parent: 4)
-        // 4 (root)
+    fn test_merge_new_lane_no_vertical_but_diagonal() {
+        // A merge commit's newly created lane should have the diagonal
+        // but NO vertical in the merge row. The renderer draws the
+        // incoming line for the next row from the diagonal's endpoint.
         let commits = vec![
             commit(1, &[2, 3]),
             commit(2, &[4]),
@@ -1340,8 +1341,6 @@ mod tests {
         ];
         let rows = layout_graph(&commits);
 
-        // Row 0 (commit 1): should have the merge diagonal AND a vertical
-        // for the second parent's lane (commit 3 appears later in that column).
         let merge_row = &rows[0];
         let has_diagonal = merge_row
             .lines
@@ -1349,8 +1348,6 @@ mod tests {
             .any(|&(f, t, _)| f == merge_row.node_col && t != f);
         assert!(has_diagonal, "Merge commit should have a diagonal edge");
 
-        // The target lane should continue vertically because commit 3
-        // will appear there in a later row.
         let target_col = merge_row
             .lines
             .iter()
@@ -1362,17 +1359,19 @@ mod tests {
             .iter()
             .any(|&(f, t, _)| f == target_col && t == target_col);
         assert!(
-            has_vertical,
-            "Merge target column {target_col} should have vertical (lane still active)"
+            !has_vertical,
+            "Newly created merge lane (col {target_col}) should not have vertical"
         );
     }
 
     #[test]
     fn test_merge_into_feature_main_continues() {
-        // Main is merged INTO a feature branch. Main should continue
-        // vertically — its lane must not be suppressed.
+        // Main is merged INTO a feature branch. Main's lane is newly
+        // created by the merge, so NO vertical in the merge row. But
+        // in subsequent rows (before commit 3 appears), main's lane
+        // should have verticals.
         //
-        // 1 (merge: 2, 3)  — feature merges main in (parents: feature-prev, main)
+        // 1 (merge: 2, 3)  — feature merges main in
         // 2 (parent: 4)    — feature branch continues
         // 3 (parent: 5)    — main continues
         // 4 (parent: 6)    — feature
@@ -1388,30 +1387,35 @@ mod tests {
         ];
         let rows = layout_graph(&commits);
 
-        // Commit 1 is a merge. Its second parent (3/main) is in another column.
-        // That column must still have a vertical continuation line because
-        // main has more commits below.
-        let merge_row = &rows[0]; // commit 1
+        let merge_row = &rows[0];
         let main_col = rows[2].node_col; // commit 3's column
 
-        // The merge row should have a diagonal to main_col
-        let has_diagonal_to_main = merge_row
+        // Merge row has diagonal to main
+        let has_diagonal = merge_row
             .lines
             .iter()
             .any(|&(f, t, _)| f == merge_row.node_col && t == main_col);
+        assert!(has_diagonal, "Merge should have diagonal to main's column");
+
+        // Merge row should NOT have vertical for new lane
+        let has_vertical_at_merge = merge_row
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == main_col && t == main_col);
         assert!(
-            has_diagonal_to_main,
-            "Merge should have diagonal to main's column"
+            !has_vertical_at_merge,
+            "New merge lane should not have vertical in merge row"
         );
 
-        // Main's column should ALSO have a vertical continuation
-        let has_main_vertical = merge_row
+        // But row 1 (commit 2) SHOULD have main's vertical continuation
+        let row_2 = &rows[1]; // commit 2
+        let has_main_vertical = row_2
             .lines
             .iter()
             .any(|&(f, t, _)| f == main_col && t == main_col);
         assert!(
             has_main_vertical,
-            "Main lane (col {main_col}) must continue vertically after being merged into"
+            "Main lane (col {main_col}) must continue vertically in rows after the merge"
         );
 
         // Main should be linear: 3 → 5
@@ -1420,30 +1424,10 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_target_no_vertical_when_immediately_consumed() {
-        // When a merge diagonal targets a lane whose commit is the very
-        // next row, AND that commit has no children keeping the lane alive
-        // from above, the vertical continuation is redundant.
-        //
-        // Specifically: merge commit where the second parent has no other
-        // lane pointing to it from above — only the merge diagonal.
-        //
-        // 1 (merge: 2, 3)  — merge
-        // 2 (parent: 4)    — first parent continues
-        // 3 (parent: 4)    — second parent, ONLY reached via merge diagonal
-        // 4 (root)
-        //
-        // At row 0 (commit 1): the diagonal (0→1) creates lane for commit 3.
-        // The vertical (1→1) is technically correct (commit 3 is in col 1 next).
-        // But visually the diagonal already connects to it, so no separate
-        // vertical is needed — the diagonal IS the connection.
-        //
-        // However: if we suppress the vertical, there's a gap between the
-        // diagonal (which ends at y_bottom of row 0) and the dot at row 1.
-        // So actually the vertical IS needed to fill row 1's top half.
-        //
-        // This test documents the current (correct) behavior: the vertical
-        // continuation is present because the lane is active.
+    fn test_merge_new_lane_no_vertical_even_with_pending_commit() {
+        // Even though the newly created lane has a pending commit,
+        // the merge row should NOT have a vertical for it. The
+        // renderer handles the incoming line for the next row.
         let commits = vec![
             commit(1, &[2, 3]),
             commit(2, &[4]),
@@ -1460,14 +1444,13 @@ mod tests {
             .unwrap()
             .1;
 
-        // The vertical IS present (lane is active with commit 3)
         let has_vertical = merge_row
             .lines
             .iter()
             .any(|&(f, t, _)| f == target_col && t == target_col);
         assert!(
-            has_vertical,
-            "Lane with pending commit should have vertical continuation"
+            !has_vertical,
+            "New merge lane should not have vertical in merge row"
         );
     }
 
@@ -1509,6 +1492,50 @@ mod tests {
                 "Consumed convergence lane (col {src_col}) should not have vertical"
             );
         }
+    }
+
+    #[test]
+    fn test_merge_new_lane_no_vertical() {
+        // A merge commit creates a NEW lane for its second parent.
+        // That new lane should NOT have a vertical continuation in the
+        // merge row because nothing is feeding it from above — only
+        // the merge diagonal connects to it.
+        //
+        // 1 (merge: 2, 3)
+        // 2 (parent: 4)
+        // 3 (parent: 4)
+        // 4 (root)
+        //
+        // At row 0: commit 1 creates a diagonal to col 1 for commit 3.
+        // Col 1 should NOT also have a vertical (1,1) — there's nothing
+        // above it, so the vertical is a stub hanging in empty space.
+        let commits = vec![
+            commit(1, &[2, 3]),
+            commit(2, &[4]),
+            commit(3, &[4]),
+            commit(4, &[]),
+        ];
+        let rows = layout_graph(&commits);
+
+        let merge_row = &rows[0];
+        // Find the new lane created by the merge
+        let new_lane_col = merge_row
+            .lines
+            .iter()
+            .find(|&&(f, t, _)| f == merge_row.node_col && t != f)
+            .unwrap()
+            .1;
+
+        // This lane was JUST created by the merge — nothing above it.
+        // It should NOT have a vertical continuation.
+        let has_vertical = merge_row
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == new_lane_col && t == new_lane_col);
+        assert!(
+            !has_vertical,
+            "Newly created merge lane (col {new_lane_col}) should not have vertical — nothing feeds it from above"
+        );
     }
 
     #[test]
