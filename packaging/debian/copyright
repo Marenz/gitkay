@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: gitkay
+Upstream-Contact: Marenz <marenz@supradigital.org>
+Source: https://github.com/Marenz/gitkay
+
+Files: *
+Copyright: 2026 Marenz
+License: MIT

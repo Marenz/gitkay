@@ -1,8 +1,12 @@
 [package]
-name = "gitkview"
-version = "0.2.0"
+name = "gitkay"
+version = "1.0.0"
 edition = "2024"
-description = "A native Wayland git history viewer (gitk replacement)"
+description = "A fast, native Wayland git history viewer — gitk, but okay"
+license = "MIT"
+repository = "https://github.com/Marenz/gitkay"
+keywords = ["git", "history", "viewer", "wayland", "egui"]
+categories = ["development-tools", "visualization"]
 
 [dependencies]
 eframe = "0.31"

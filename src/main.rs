@@ -474,6 +474,31 @@ fn author_color(name: &str) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
+/// Extended palette for ref labels — more variation than graph colors.
+const REF_COLORS: &[(u8, u8, u8)] = &[
+    (203, 166, 247), // mauve
+    (148, 226, 213), // teal
+    (249, 226, 175), // yellow
+    (166, 227, 161), // green
+    (245, 194, 231), // pink
+    (137, 180, 250), // blue
+    (250, 179, 135), // peach
+    (137, 220, 235), // sky
+    (180, 190, 254), // lavender
+    (242, 205, 205), // flamingo
+    (245, 224, 220), // rosewater
+    (148, 187, 233), // sapphire
+];
+
+/// Deterministic color for a ref name.
+fn ref_color(name: &str) -> egui::Color32 {
+    let hash = name
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(37).wrapping_add(b as u32));
+    let (r, g, b) = REF_COLORS[(hash as usize) % REF_COLORS.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
 const BG: egui::Color32 = egui::Color32::from_rgb(30, 30, 46);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(205, 214, 244);
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(108, 112, 134);
@@ -976,25 +1001,22 @@ impl eframe::App for GitkApp {
                         let text_x = top_left.x + graph_width;
                         let mut cursor_x = text_x;
 
-                        // Ref labels
+                        // Ref labels — unique color per ref name
                         for (ref_name, kind) in &commit.refs {
                             let (bg, fg) = match kind {
-                                RefKind::Head => (
-                                    egui::Color32::from_rgba_unmultiplied(243, 139, 168, 80),
-                                    RED,
-                                ),
-                                RefKind::Branch => (
-                                    egui::Color32::from_rgba_unmultiplied(166, 227, 161, 50),
-                                    GREEN,
-                                ),
-                                RefKind::Remote => (
-                                    egui::Color32::from_rgba_unmultiplied(137, 180, 250, 50),
-                                    BLUE,
-                                ),
-                                RefKind::Tag => (
-                                    egui::Color32::from_rgba_unmultiplied(249, 226, 175, 50),
-                                    YELLOW,
-                                ),
+                                RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
+                                RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
+                                RefKind::Branch | RefKind::Remote => {
+                                    // Unique color per branch/remote name
+                                    let color = ref_color(ref_name);
+                                    let bg = egui::Color32::from_rgba_unmultiplied(
+                                        (color.r() / 4).max(20),
+                                        (color.g() / 4).max(20),
+                                        (color.b() / 4).max(20),
+                                        200,
+                                    );
+                                    (bg, color)
+                                }
                             };
                             let font = egui::FontId::monospace(11.0);
                             let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
@@ -1088,8 +1110,8 @@ fn main() -> eframe::Result {
             .workdir()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or("gitkview");
-        format!("gitkview — {workdir}")
+            .unwrap_or("gitkay");
+        format!("gitkay — {workdir}")
     };
 
     let options = eframe::NativeOptions {

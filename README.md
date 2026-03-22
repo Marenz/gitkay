@@ -1,84 +1,143 @@
-<h1 align="center">gitkview</h1>
+<h1 align="center">
+  <br>
+  gitkay
+  <br>
+</h1>
+
+<h3 align="center">gitk, but okay.</h3>
 
 <p align="center">
-  <b>Native Wayland git history viewer</b><br>
-  <i>A gitk replacement built with Rust + egui</i>
+  A fast, native Wayland git history viewer built with Rust.
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#install">Install</a> •
+  <a href="#usage">Usage</a> •
+  <a href="#why">Why</a> •
+  <a href="#license">License</a>
+</p>
+
+<p align="center">
+  <img src="screenshot.png" alt="gitkay screenshot" width="800">
 </p>
 
 ---
 
-## Why
+## Why?
 
-gitk is a Tcl/Tk app that needs XWayland, has stale X11 selection issues on Wayland, and looks dated. gitkview is a native Wayland app with a modern dark theme, built for browsing commit graphs and diffs.
+**gitk** is a Tcl/Tk app from 2005. On Wayland it needs XWayland, has stale X11 selection bugs, and looks like it time-traveled from Windows 98.
+
+**gitkay** is what gitk would be if it was written today:
+
+- Native Wayland — no XWayland, no Tk, no X11 selection bugs
+- Starts in **under 200ms** — lazy loading, precomputed ref maps
+- Catppuccin Mocha dark theme that matches your rice
+- Written in Rust, single binary, zero config
 
 ## Features
 
-- **Commit graph** — colored lanes with merge/branch visualization, consistent lane colors across column shifts
-- **Diff view** — syntax-highlighted diffs (adds green, deletes red, hunks blue, file headers yellow, metadata purple)
-- **File list sidebar** — clickable file names with +/- stats, click to jump to file's diff
-- **Search** — filter commits by SHA, author name, commit message, or ref name
-- **SHA copy** — click a commit to copy its SHA to clipboard
-- **Ref labels** — colored badges for HEAD, branches, remotes, tags
-- **Author colors** — each author gets a unique consistent color
-- **Virtual scrolling** — handles repos with thousands of commits
-- **Catppuccin Mocha** dark theme
+### Commit Graph
+- Color-coded branch lanes with consistent colors across column shifts
+- Merge/branch diagonals rendered cleanly — no stubs, no gaps, no false branches
+- Lane-based layout: first parent always continues straight down
+- Convergence detection when multiple branches meet at one commit
+- Virtual scrolling with lazy loading — handles repos with thousands of commits
+
+### Diff Viewer
+- Syntax-highlighted diffs: additions in green, deletions in red, hunk headers in blue, file headers in yellow
+- File list sidebar with per-file `+/-` stats
+- Click a file to jump to its diff section
+- Commit header with author, date, full message
+
+### Search
+- Full-width search bar — filter by SHA, author, commit message, branch name, tag name
+- Press **Enter** to cycle through matches with `3/42` counter
+- Matching commits highlighted in the graph
+
+### Quality of Life
+- **Click a commit** to copy its SHA to both clipboard and primary selection
+- **Auto-select** first commit on startup with diff shown
+- **Lazy loading** — starts with 200 commits, loads more as you scroll
+- **Unique author colors** — each contributor gets a distinct color
+- **Unique ref colors** — each branch/remote gets its own color with readable contrast
+- **Ref badges** — colored labels for HEAD, branches, remotes, tags
+- **Hover effects** — file list highlights on hover with full path tooltip
 
 ## Install
 
-### Requirements
-
-- Rust 1.75+
-- GTK4 dev libraries (for egui's Wayland backend): `gtk4-devel`, `libgraphene-devel`
-- libgit2 dev: usually pulled in by `git2` crate, may need `openssl-devel`
-
-### Build
+### From source (recommended)
 
 ```sh
-git clone https://github.com/Marenz/gitkview
-cd gitkview
+git clone https://github.com/Marenz/gitkay
+cd gitkay
 cargo build --release
-cp target/release/gitkview ~/.local/bin/
+sudo cp target/release/gitkay /usr/local/bin/
+```
+
+### Build dependencies
+
+**openSUSE Tumbleweed:**
+```sh
+sudo zypper install gtk4-devel libgraphene-devel openssl-devel
+```
+
+**Ubuntu / Debian:**
+```sh
+sudo apt install libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
+```
+
+**Fedora:**
+```sh
+sudo dnf install gtk4-devel graphene-devel openssl-devel
+```
+
+### openSUSE RPM
+
+```sh
+rpmbuild -ba packaging/gitkay.spec
+sudo rpm -i ~/rpmbuild/RPMS/x86_64/gitkay-*.rpm
+```
+
+### Ubuntu / Debian .deb
+
+```sh
+dpkg-buildpackage -us -uc -b
+sudo dpkg -i ../gitkay_*.deb
 ```
 
 ## Usage
 
 ```sh
-# From inside a git repo
-gitkview
+# Inside a git repo
+gitkay
 
 # Or specify a path
-gitkview /path/to/repo
+gitkay /path/to/repo
 ```
 
 ### Controls
 
 | Action | Effect |
 |---|---|
-| Click commit | Select, show diff, copy SHA |
-| Scroll | Browse commit history |
-| Type in search | Filter by SHA/author/message/ref |
-| Click file in sidebar | Jump to that file's diff |
-| Hover file | Show full path tooltip |
+| **Click** commit | Select, show diff, copy SHA to clipboard |
+| **Scroll** | Browse history (lazy loads more commits) |
+| **Type** in search bar | Filter by SHA / author / message / branch / tag |
+| **Enter** in search | Cycle through matches |
+| **Click** file in sidebar | Jump to file's diff section |
+| **Hover** file in sidebar | Full path tooltip |
 
 ## Architecture
 
-Single-file Rust app (`src/main.rs`):
+Single-file Rust app (~1600 lines) with 14 unit tests:
 
-- **git2** (libgit2) for repo access — revwalk, diff, refs
-- **egui** + **eframe** for the UI — immediate-mode rendering on a Wayland-native window
-- **chrono** for date formatting
+- **egui** + **eframe** — native Wayland window with wgpu rendering
+- **git2** (libgit2) — repository access, revwalk, diff
+- **chrono** — date formatting
+- **arboard** — clipboard (both clipboard and primary selection)
 
-The commit graph uses a lane-based layout algorithm:
-- Pipes track active lanes with `Option<(Oid, color)>` slots
-- First parent always continues in the node's column (no unnecessary shifts)
-- Additional parents open new lanes in empty slots
-- Convergence detected when multiple lanes point to the same commit
-- Colors are tracked per-lane, not per-column, so they survive column shifts
-
-## Screenshot
-
-Launch on any git repo — the commit graph is on the left, commit messages in the center, author/date on the right, diff + file list at the bottom.
+The graph layout uses a pipe-based algorithm where each lane tracks an OID and a persistent color index. First parent always continues in the same column. Colors survive column shifts. Convergence is detected when multiple lanes point to the same commit.
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -1265,8 +1265,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitkview"
-version = "0.2.0"
+name = "gitkay"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "chrono",

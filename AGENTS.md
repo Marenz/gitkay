@@ -1,68 +1,69 @@
-# gitkview
+# gitkay
 
-Native Wayland git history viewer — a gitk replacement built with Rust + egui.
+Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ## Build / Test
 
 ```sh
-cargo build --release    # release build
-cargo test               # graph layout tests (9 tests)
-cp target/release/gitkview ~/.local/bin/
+cargo build --release
+cargo test                # 14 graph layout tests
+cp target/release/gitkay ~/.local/bin/
 ```
 
-System dependencies (openSUSE): `gtk4-devel libgraphene-devel`
+System dependencies (openSUSE): `gtk4-devel libgraphene-devel openssl-devel`
 
 ## Architecture
 
-Single-file app at `src/main.rs`. Three main sections:
+Single-file app at `src/main.rs` (~1600 lines). Three sections:
 
 ### Data Layer
-- `load_commits()` — walks the git repo via `git2::Revwalk` (topological + time order), collects commit info, refs
-- `collect_refs()` — maps OIDs to branch/tag/remote ref names
-- `get_diff_data()` — generates diff lines with syntax classification + file list with per-file add/delete counts and diff line offsets
+- `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
+- `build_ref_map()` — single pass over all refs, O(refs) instead of O(commits × refs)
+- `get_diff_data()` — diff lines with syntax classification + file list with per-file stats and line offsets
 
 ### Graph Layout (`layout_graph()`)
-- **Pipes**: `Vec<Option<(Oid, color_index)>>` — each slot is a lane. `None` = empty slot.
-- **Algorithm**: For each commit (newest first):
-  1. Find which pipe slot matches this commit's OID (or create new slot)
-  2. Check for convergence: multiple pipes pointing to the same commit → merge lines
-  3. Clear the node's slot
-  4. First parent reuses the node's column (same color). Even if parent is already tracked elsewhere, keep both lanes — convergence resolved when parent is processed.
-  5. Additional parents get new lanes in empty slots or appended
-  6. All other active pipes continue straight
-  7. Trim trailing empty slots
-- **Key invariant**: first parent always continues straight down in the same column → no unnecessary diagonals for linear history
-- **Color tracking**: each pipe has a color index that persists through column shifts. `next_color` increments globally for new branches.
+- **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty
+- **Algorithm** per commit:
+  1. Find matching pipe(s). Multiple matches = convergence → merge lines + clear extras
+  2. Clear node slot. First parent reuses node column (same color). Even if parent tracked elsewhere, keep both — convergence resolves at parent's row
+  3. Additional parents get new lanes in empty slots (tracked as `new_lanes`)
+  4. Other active pipes continue straight. Skip `new_lanes` (no vertical stub)
+  5. Add convergence lines. Trim trailing empty slots
+- **Key invariant**: first parent always continues straight → no false diagonals
+- **Color tracking**: per-pipe color index, persists through column shifts
 
-### UI (egui)
-- **Top panel**: search bar (filters commits by SHA/author/message/ref)
-- **Central panel**: commit graph + list with manual virtual scrolling (pre-spacer, painter, post-spacer)
-- **Bottom panel**: horizontally split — left is diff view, right is file list sidebar
-- **Graph rendering**: each edge `(from_col, to_col, color)` drawn as a line segment. Lines touching the node column split around the dot. First commits (no incoming line from above) skip the top half.
-- **Text layout**: summary clipped to available width before author/date. Author colors via deterministic hash.
+### UI (egui immediate mode)
+- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches
+- **Central panel**: commit graph + list. Manual virtual scrolling (pre-spacer, painter, post-spacer). Lazy loading (200 initial, +500 on scroll-near-bottom)
+- **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width)
+- **Graph rendering**: each edge `(from, to, color)` = one line segment. Lines touching node split around dot. No incoming line for first commits (no parent above)
+- **Text**: summary clipped via `with_clip_rect`. Authors colored by hash. Refs colored by name hash (12-color extended palette)
+- **Clipboard**: SHA copied to both clipboard + primary selection on click
 
-## Graph Tests
+## Tests (14)
 
-Tests use fake OIDs (`oid(n)`) and `CommitInfo` structs without a real git repo.
+All use fake OIDs via `oid(n)` — no real git repo needed.
 
-Key test cases:
-- `test_linear_history` — 4 linear commits stay in col 0, no diagonals
-- `test_simple_branch_and_merge` — merge commit has diagonal, first parent stays in col 0
-- `test_linear_branch_no_diagonals` — two parallel branches, no false diagonals on linear commits
-- `test_parallel_branches_stable_columns` — two independent branches keep their columns
-- `test_pr_merge_pattern` — GitHub PR merge: main in col 0, PR branch in col 1
-- `test_sequential_merges` — multiple PRs merged in sequence, main stays col 0
-- `test_branch_after_merge_stays_stable` — convergence lines drawn correctly when branches meet
-
-## Dependencies
-
-- `eframe` / `egui` — native Wayland window + immediate-mode UI
-- `git2` — libgit2 bindings for repo access
-- `chrono` — date formatting
+- `test_linear_history` — 4 commits, col 0, no diagonals
+- `test_simple_branch_and_merge` — merge diagonal, first parent col 0
+- `test_linear_branch_no_diagonals` — parallel branches, no false diagonals
+- `test_parallel_branches_stable_columns` — independent branches keep columns
+- `test_pr_merge_pattern` — GitHub PR: main col 0, PR col 1
+- `test_sequential_merges` — multiple PRs, main stays col 0
+- `test_branch_after_merge_stays_stable` — convergence drawn correctly
+- `test_merge_commit_has_diagonal` — merge has at least one diagonal
+- `test_merge_new_lane_no_vertical` — new merge lane: no vertical stub
+- `test_merge_new_lane_no_vertical_but_diagonal` — diagonal present, no vertical
+- `test_merge_new_lane_no_vertical_even_with_pending_commit` — even with future commit
+- `test_merge_into_feature_main_continues` — main vertical persists after merge-into
+- `test_convergence_no_vertical_on_consumed_lane` — consumed lanes: no vertical
+- `test_many_linear_commits_stay_in_column` — 10 linear commits, all col 0
 
 ## Common Pitfalls
 
-- egui's `show_rows` doesn't fill the viewport exactly → use manual virtualization with pre/post spacers
-- `layout_no_wrap` + `with_clip_rect` for summary text truncation (egui `layout()` wraps text)
-- Lane colors must be tracked per-pipe, not per-column-position, or they change when columns shift
-- When two branches target the same parent, both keep their lanes going — convergence is handled when the parent commit is processed (finding multiple matching pipes)
+- egui `show_rows` leaves a gap → manual virtualization with pre/post spacers
+- `layout_no_wrap` + `with_clip_rect` for text truncation (egui `layout()` wraps)
+- Lane colors: track per-pipe, not per-column, or colors change on shifts
+- Two branches → same parent: both keep lanes, convergence at parent row
+- New merge lanes: skip vertical (diagonal already connects, no source above)
+- `collect_refs` per commit is O(commits × refs) → precompute ref map once
