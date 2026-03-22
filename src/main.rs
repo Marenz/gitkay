@@ -448,19 +448,40 @@ impl eframe::App for GitkApp {
             .resizable(true)
             .min_height(100.0)
             .default_height(300.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(4, 0)),
+            )
             .show(ctx, |ui| {
+                // Wider resize grab area
+                ui.add_space(3.0);
+                ui.separator();
+                ui.add_space(2.0);
+
                 ui.horizontal_top(|ui| {
+                    // Compute sidebar width based on content
+                    let sidebar_width = if self.diff_files.is_empty() {
+                        60.0
+                    } else {
+                        let max_name_len = self
+                            .diff_files
+                            .iter()
+                            .map(|f| f.path.rsplit('/').next().unwrap_or(&f.path).len())
+                            .max()
+                            .unwrap_or(8);
+                        // ~7px per char + stat labels + padding
+                        ((max_name_len as f32 * 7.5) + 80.0).clamp(120.0, 300.0)
+                    };
+
                     // Left: diff content (scrollable)
-                    let diff_width = ui.available_width() - 220.0;
+                    let diff_width = ui.available_width() - sidebar_width - 10.0;
                     ui.allocate_ui_with_layout(
                         egui::vec2(diff_width.max(200.0), ui.available_height()),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
-                            let scroll_id = egui::Id::new("diff_scroll");
-                            let mut scroll = egui::ScrollArea::both().id_salt(scroll_id);
+                            let mut scroll = egui::ScrollArea::both().id_salt("diff_scroll");
 
-                            // Handle scroll-to-file
                             if let Some(target_line) = self.diff_scroll_to.take() {
                                 let target_y = target_line as f32 * 16.0;
                                 scroll = scroll.vertical_scroll_offset(target_y);
@@ -486,60 +507,100 @@ impl eframe::App for GitkApp {
 
                     ui.separator();
 
-                    // Right: file list
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{} files", self.diff_files.len()))
-                                .color(SUBTEXT)
-                                .size(11.0),
-                        );
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("file_list")
-                            .show(ui, |ui| {
-                                for file in &self.diff_files {
-                                    let short_path =
-                                        file.path.rsplit('/').next().unwrap_or(&file.path);
-                                    let stat = format!("+{} -{}", file.additions, file.deletions);
-                                    let line_idx = file.diff_line_idx;
+                    // Right: file list with hover effects
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(sidebar_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            if !self.diff_files.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("{} files", self.diff_files.len()))
+                                        .color(SUBTEXT)
+                                        .size(11.0),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("file_list")
+                                .show(ui, |ui| {
+                                    for file in &self.diff_files {
+                                        let short_path =
+                                            file.path.rsplit('/').next().unwrap_or(&file.path);
+                                        let line_idx = file.diff_line_idx;
 
-                                    ui.horizontal(|ui| {
-                                        // Stat indicators
-                                        if file.additions > 0 {
-                                            ui.colored_label(
-                                                GREEN,
-                                                egui::RichText::new(format!("+{}", file.additions))
-                                                    .size(10.0),
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), 18.0),
+                                            egui::Sense::click(),
+                                        );
+
+                                        // Hover highlight
+                                        if resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                2.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    203, 166, 247, 20,
+                                                ),
                                             );
+                                        }
+
+                                        // Stat indicators
+                                        let mut x = rect.min.x + 2.0;
+                                        let cy = rect.center().y;
+                                        if file.additions > 0 {
+                                            let g = ui.painter().layout_no_wrap(
+                                                format!("+{}", file.additions),
+                                                egui::FontId::monospace(10.0),
+                                                GREEN,
+                                            );
+                                            ui.painter().galley(
+                                                egui::pos2(x, cy - 6.0),
+                                                g.clone(),
+                                                GREEN,
+                                            );
+                                            x += g.size().x + 3.0;
                                         }
                                         if file.deletions > 0 {
-                                            ui.colored_label(
+                                            let g = ui.painter().layout_no_wrap(
+                                                format!("-{}", file.deletions),
+                                                egui::FontId::monospace(10.0),
                                                 RED,
-                                                egui::RichText::new(format!("-{}", file.deletions))
-                                                    .size(10.0),
                                             );
+                                            ui.painter().galley(
+                                                egui::pos2(x, cy - 6.0),
+                                                g.clone(),
+                                                RED,
+                                            );
+                                            x += g.size().x + 3.0;
                                         }
 
-                                        // Clickable file name with tooltip
-                                        if ui
-                                            .add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(short_path)
-                                                        .color(TEXT)
-                                                        .size(12.0),
-                                                )
-                                                .sense(egui::Sense::click())
-                                                .truncate(),
-                                            )
-                                            .on_hover_text_at_pointer(&file.path)
-                                            .clicked()
-                                        {
+                                        // File name
+                                        let name_color = if resp.hovered() {
+                                            egui::Color32::from_rgb(220, 224, 252)
+                                        } else {
+                                            TEXT
+                                        };
+                                        let ng = ui.painter().layout_no_wrap(
+                                            short_path.to_string(),
+                                            egui::FontId::monospace(12.0),
+                                            name_color,
+                                        );
+                                        ui.painter().galley(
+                                            egui::pos2(x + 4.0, cy - 7.0),
+                                            ng,
+                                            name_color,
+                                        );
+
+                                        if resp.clicked() {
                                             self.diff_scroll_to = Some(line_idx);
                                         }
-                                    });
-                                }
-                            });
-                    });
+                                        if resp.hovered() {
+                                            resp.show_tooltip_text(&file.path);
+                                        }
+                                    }
+                                });
+                        },
+                    );
                 });
             });
 
@@ -556,13 +617,13 @@ impl eframe::App for GitkApp {
                 * col_width
                 + 8.0;
 
-            let available_height = ui.available_height();
-
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show_rows(ui, row_height, num_commits, |ui, row_range| {
-                    // Allocate the full height for all visible rows
-                    let total_height = (row_range.end - row_range.start) as f32 * row_height;
+                    let row_count = row_range.end - row_range.start;
+                    let rows_height = row_count as f32 * row_height;
+                    // Ensure we fill at least the visible area to avoid bottom gap
+                    let total_height = rows_height.max(ui.available_height());
                     let (response, painter) = ui.allocate_painter(
                         egui::vec2(ui.available_width(), total_height),
                         egui::Sense::click(),
