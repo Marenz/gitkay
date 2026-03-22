@@ -398,18 +398,11 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
         }
 
         // All other active lanes continue straight — but skip lanes
-        // that are already the target of a merge line from the node
-        // (those lanes are being merged into, not continuing).
-        let merge_targets: Vec<usize> = lines
-            .iter()
-            .filter(|&&(from, to, _)| from == node_col && to != node_col)
-            .map(|&(_, to, _)| to)
-            .collect();
+        // that were consumed by convergence (pipe cleared above).
+        // Merge targets that still have an active pipe continue normally
+        // (e.g. main merged into feature — main still has commits below).
         for (col, pipe) in pipes.iter().enumerate() {
             if col == node_col {
-                continue;
-            }
-            if merge_targets.contains(&col) {
                 continue;
             }
             if let Some((_, color)) = pipe {
@@ -1332,9 +1325,9 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_target_no_vertical_continuation() {
-        // When a merge commit draws a diagonal to a lane, that lane
-        // should NOT also have a straight vertical continuation.
+    fn test_merge_target_has_vertical_when_lane_active() {
+        // When a merge commit draws a diagonal to a lane that still has
+        // future commits, the lane should ALSO continue vertically.
         // 1 (merge: 2, 3)
         // 2 (parent: 4)
         // 3 (parent: 4)
@@ -1347,26 +1340,83 @@ mod tests {
         ];
         let rows = layout_graph(&commits);
 
-        // Row 0 (commit 1): should have the merge diagonal but NO
-        // straight vertical continuation in the target column.
+        // Row 0 (commit 1): should have the merge diagonal AND a vertical
+        // for the second parent's lane (commit 3 appears later in that column).
         let merge_row = &rows[0];
-        let merge_targets: Vec<usize> = merge_row
+        let has_diagonal = merge_row
             .lines
             .iter()
-            .filter(|&&(f, t, _)| f != t && f == merge_row.node_col)
-            .map(|&(_, t, _)| t)
-            .collect();
+            .any(|&(f, t, _)| f == merge_row.node_col && t != f);
+        assert!(has_diagonal, "Merge commit should have a diagonal edge");
 
-        for target_col in &merge_targets {
-            let has_vertical = merge_row
-                .lines
-                .iter()
-                .any(|&(f, t, _)| f == *target_col && t == *target_col);
-            assert!(
-                !has_vertical,
-                "Merge target column {target_col} should not have a vertical continuation"
-            );
-        }
+        // The target lane should continue vertically because commit 3
+        // will appear there in a later row.
+        let target_col = merge_row
+            .lines
+            .iter()
+            .find(|&&(f, t, _)| f == merge_row.node_col && t != f)
+            .unwrap()
+            .1;
+        let has_vertical = merge_row
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == target_col && t == target_col);
+        assert!(
+            has_vertical,
+            "Merge target column {target_col} should have vertical (lane still active)"
+        );
+    }
+
+    #[test]
+    fn test_merge_into_feature_main_continues() {
+        // Main is merged INTO a feature branch. Main should continue
+        // vertically — its lane must not be suppressed.
+        //
+        // 1 (merge: 2, 3)  — feature merges main in (parents: feature-prev, main)
+        // 2 (parent: 4)    — feature branch continues
+        // 3 (parent: 5)    — main continues
+        // 4 (parent: 6)    — feature
+        // 5 (parent: 6)    — main
+        // 6 (root)
+        let commits = vec![
+            commit(1, &[2, 3]),
+            commit(2, &[4]),
+            commit(3, &[5]),
+            commit(4, &[6]),
+            commit(5, &[6]),
+            commit(6, &[]),
+        ];
+        let rows = layout_graph(&commits);
+
+        // Commit 1 is a merge. Its second parent (3/main) is in another column.
+        // That column must still have a vertical continuation line because
+        // main has more commits below.
+        let merge_row = &rows[0]; // commit 1
+        let main_col = rows[2].node_col; // commit 3's column
+
+        // The merge row should have a diagonal to main_col
+        let has_diagonal_to_main = merge_row
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == merge_row.node_col && t == main_col);
+        assert!(
+            has_diagonal_to_main,
+            "Merge should have diagonal to main's column"
+        );
+
+        // Main's column should ALSO have a vertical continuation
+        let has_main_vertical = merge_row
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == main_col && t == main_col);
+        assert!(
+            has_main_vertical,
+            "Main lane (col {main_col}) must continue vertically after being merged into"
+        );
+
+        // Main should be linear: 3 → 5
+        assert_linear(&rows, &commits, 3, 5);
+        assert_colors_consistent(&rows);
     }
 
     #[test]
