@@ -1,0 +1,10 @@
+[package]
+name = "gitkview"
+version = "0.1.0"
+edition = "2024"
+description = "A native Wayland git history viewer (gitk replacement)"
+
+[dependencies]
+gtk4 = "0.9"
+git2 = "0.19"
+chrono = "0.4"
