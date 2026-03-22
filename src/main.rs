@@ -617,15 +617,27 @@ impl eframe::App for GitkApp {
                 * col_width
                 + 8.0;
 
-            // Paint background to fill the entire central panel (prevents gap)
-            let panel_rect = ui.available_rect_before_wrap();
-            ui.painter().rect_filled(panel_rect, 0.0, BG);
-
+            let panel_height = ui.available_height();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show_rows(ui, row_height, num_commits, |ui, row_range| {
-                    let row_count = row_range.end - row_range.start;
-                    let rows_height = row_count as f32 * row_height;
+                .show(ui, |ui| {
+                    // Total content height
+                    let total_content = num_commits as f32 * row_height;
+                    let total_height = total_content.max(panel_height);
+
+                    // Spacer before visible rows
+                    let scroll_offset = ui.clip_rect().min.y - ui.cursor().min.y;
+                    let first_row = (scroll_offset / row_height).floor().max(0.0) as usize;
+                    let visible_rows = (panel_height / row_height).ceil() as usize + 2;
+                    let last_row = (first_row + visible_rows).min(num_commits);
+                    let row_range = first_row..last_row;
+
+                    // Pre-spacer
+                    if first_row > 0 {
+                        ui.allocate_space(egui::vec2(0.0, first_row as f32 * row_height));
+                    }
+
+                    let rows_height = (last_row - first_row) as f32 * row_height;
                     let (response, painter) = ui.allocate_painter(
                         egui::vec2(ui.available_width(), rows_height),
                         egui::Sense::click(),
@@ -812,6 +824,13 @@ impl eframe::App for GitkApp {
                             author_galley,
                             a_color,
                         );
+                    }
+
+                    // Post-spacer to maintain correct total scroll height
+                    let drawn_bottom = last_row as f32 * row_height;
+                    let remaining = total_height - drawn_bottom;
+                    if remaining > 0.0 {
+                        ui.allocate_space(egui::vec2(0.0, remaining));
                     }
                 });
         });
