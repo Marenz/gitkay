@@ -291,43 +291,56 @@ struct GraphRow {
 }
 
 fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
-    let mut pipes: Vec<git2::Oid> = Vec::new();
+    // Each pipe tracks (oid, color_index)
+    let mut pipes: Vec<(git2::Oid, usize)> = Vec::new();
+    let mut next_color: usize = 0;
     let mut rows = Vec::new();
     let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
 
     for commit in commits {
         let node_col = pipes
             .iter()
-            .position(|p| *p == commit.oid)
+            .position(|p| p.0 == commit.oid)
             .unwrap_or_else(|| {
-                pipes.push(commit.oid);
+                let color = next_color;
+                next_color += 1;
+                pipes.push((commit.oid, color));
                 pipes.len() - 1
             });
 
+        let node_color = pipes[node_col].1;
         let num_cols_before = pipes.len();
-        let mut next_pipes: Vec<git2::Oid> = Vec::new();
+        let mut next_pipes: Vec<(git2::Oid, usize)> = Vec::new();
         let mut lines: Vec<(usize, usize, usize)> = Vec::new();
 
-        for (col, &pipe_oid) in pipes.iter().enumerate() {
+        // Continue all other lanes (keep their color)
+        for (col, &(pipe_oid, pipe_color)) in pipes.iter().enumerate() {
             if col == node_col {
                 continue;
             }
             let next_col = next_pipes.len();
-            next_pipes.push(pipe_oid);
-            lines.push((col, next_col, col));
+            next_pipes.push((pipe_oid, pipe_color));
+            lines.push((col, next_col, pipe_color));
         }
 
+        // Insert parents
         let mut first_parent = true;
         for parent_oid in &commit.parents {
             if !oid_set.contains(parent_oid) {
                 continue;
             }
-            if let Some(existing) = next_pipes.iter().position(|p| *p == *parent_oid) {
-                lines.push((node_col, existing, node_col));
+            if let Some(existing) = next_pipes.iter().position(|p| p.0 == *parent_oid) {
+                // Merge into existing lane
+                lines.push((node_col, existing, node_color));
             } else {
+                // New lane for this parent
+                let parent_color = if first_parent { node_color } else { next_color };
+                if !first_parent {
+                    next_color += 1;
+                }
                 let target_col = if first_parent {
                     let insert_pos = node_col.min(next_pipes.len());
-                    next_pipes.insert(insert_pos, *parent_oid);
+                    next_pipes.insert(insert_pos, (*parent_oid, parent_color));
                     for line in &mut lines {
                         if line.1 >= insert_pos {
                             line.1 += 1;
@@ -335,14 +348,10 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
                     }
                     insert_pos
                 } else {
-                    next_pipes.push(*parent_oid);
+                    next_pipes.push((*parent_oid, parent_color));
                     next_pipes.len() - 1
                 };
-                lines.push((
-                    node_col,
-                    target_col,
-                    if first_parent { node_col } else { target_col },
-                ));
+                lines.push((node_col, target_col, parent_color));
                 first_parent = false;
             }
             if first_parent {
@@ -764,70 +773,60 @@ impl eframe::App for GitkApp {
                         };
 
                         // ── Graph ──
-                        // Straight-through lanes
+                        // Each edge (from, to, color) represents a line in this
+                        // row from column `from` at y_top to column `to` at y_bottom.
                         for &(from, to, color_col) in &gr.lines {
-                            if from == to && from != gr.node_col {
-                                let c = graph_color(color_col).linear_multiply(0.5);
+                            let c = graph_color(color_col).linear_multiply(if from == to {
+                                0.5
+                            } else {
+                                0.7
+                            });
+                            let stroke = egui::Stroke::new(2.0, c);
+                            let x_top = gx(from);
+                            let x_bot = gx(to);
+
+                            // Check if this line passes through the node
+                            let touches_node = from == gr.node_col || to == gr.node_col;
+
+                            if !touches_node {
+                                // Straight or diagonal, doesn't touch the node
                                 painter.line_segment(
-                                    [egui::pos2(gx(from), y_top), egui::pos2(gx(to), y_bottom)],
-                                    egui::Stroke::new(2.0, c),
+                                    [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
+                                    stroke,
                                 );
-                            }
-                        }
-
-                        // Incoming lines (top → dot)
-                        // Draw from each source in the previous row that targets our node_col
-                        if idx > 0 {
-                            let prev = &self.graph_rows[idx - 1];
-                            for &(from, to, color_col) in &prev.lines {
-                                if to == gr.node_col {
-                                    let c = graph_color(color_col).linear_multiply(0.7);
-                                    if from == to {
-                                        // Straight down into dot
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(gx(gr.node_col), y_top),
-                                                egui::pos2(gx(gr.node_col), y_center - dot_radius),
-                                            ],
-                                            egui::Stroke::new(2.0, c),
-                                        );
-                                    } else {
-                                        // Diagonal from previous row's source into our dot
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(gx(from), y_top),
-                                                egui::pos2(gx(gr.node_col), y_center - dot_radius),
-                                            ],
-                                            egui::Stroke::new(2.0, c),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Outgoing line (dot → bottom)
-                        if gr
-                            .lines
-                            .iter()
-                            .any(|&(f, t, _)| f == gr.node_col && t == gr.node_col)
-                        {
-                            let c = graph_color(gr.node_col).linear_multiply(0.7);
-                            painter.line_segment(
-                                [
-                                    egui::pos2(gx(gr.node_col), y_center + dot_radius),
-                                    egui::pos2(gx(gr.node_col), y_bottom),
-                                ],
-                                egui::Stroke::new(2.0, c),
-                            );
-                        }
-
-                        // Branch/merge diagonals
-                        for &(from, to, color_col) in &gr.lines {
-                            if from != to {
-                                let c = graph_color(color_col).linear_multiply(0.7);
+                            } else if from == to && from == gr.node_col {
+                                // Node's own lane continuation: split around dot
                                 painter.line_segment(
-                                    [egui::pos2(gx(from), y_center), egui::pos2(gx(to), y_bottom)],
-                                    egui::Stroke::new(2.0, c),
+                                    [
+                                        egui::pos2(x_top, y_top),
+                                        egui::pos2(x_top, y_center - dot_radius - 1.0),
+                                    ],
+                                    stroke,
+                                );
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x_bot, y_center + dot_radius + 1.0),
+                                        egui::pos2(x_bot, y_bottom),
+                                    ],
+                                    stroke,
+                                );
+                            } else if from == gr.node_col {
+                                // Outgoing from node: dot center → target column bottom
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(gx(gr.node_col), y_center),
+                                        egui::pos2(x_bot, y_bottom),
+                                    ],
+                                    stroke,
+                                );
+                            } else if to == gr.node_col {
+                                // Incoming to node: source column top → dot center
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x_top, y_top),
+                                        egui::pos2(gx(gr.node_col), y_center),
+                                    ],
+                                    stroke,
                                 );
                             }
                         }
