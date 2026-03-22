@@ -617,205 +617,203 @@ impl eframe::App for GitkApp {
                 * col_width
                 + 8.0;
 
-            let scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
-            scroll_area.show(ui, |ui| {
-                // Total virtual height for all commits
-                let total_height = num_commits as f32 * row_height;
-                let (response, painter) = ui.allocate_painter(
-                    egui::vec2(ui.available_width(), total_height),
-                    egui::Sense::click(),
-                );
-                let top_left = response.rect.min;
+            // Paint background to fill the entire central panel (prevents gap)
+            let panel_rect = ui.available_rect_before_wrap();
+            ui.painter().rect_filled(panel_rect, 0.0, BG);
 
-                // Determine visible row range from clip rect
-                let clip = ui.clip_rect();
-                let first_visible =
-                    ((clip.min.y - top_left.y) / row_height).floor().max(0.0) as usize;
-                let last_visible =
-                    ((clip.max.y - top_left.y) / row_height).ceil().max(0.0) as usize;
-                let row_range = first_visible..last_visible.min(num_commits);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, num_commits, |ui, row_range| {
+                    let row_count = row_range.end - row_range.start;
+                    let rows_height = row_count as f32 * row_height;
+                    let (response, painter) = ui.allocate_painter(
+                        egui::vec2(ui.available_width(), rows_height),
+                        egui::Sense::click(),
+                    );
+                    let top_left = response.rect.min;
 
-                // Check click
-                if response.clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let row_offset = ((pos.y - top_left.y) / row_height) as usize;
-                        let clicked_idx = row_offset;
-                        if clicked_idx < num_commits {
-                            self.selected = Some(clicked_idx);
-                            let repo = Repository::discover(&self.repo_path).unwrap();
-                            let data = get_diff_data(&repo, self.commits[clicked_idx].oid);
-                            self.diff_lines = data.lines;
-                            self.diff_files = data.files;
+                    // Check click
+                    if response.clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let row_offset = ((pos.y - top_left.y) / row_height) as usize;
+                            let clicked_idx = row_range.start + row_offset;
+                            if clicked_idx < num_commits {
+                                self.selected = Some(clicked_idx);
+                                let repo = Repository::discover(&self.repo_path).unwrap();
+                                let data = get_diff_data(&repo, self.commits[clicked_idx].oid);
+                                self.diff_lines = data.lines;
+                                self.diff_files = data.files;
+                            }
                         }
                     }
-                }
 
-                for idx in row_range.clone() {
-                    let commit = &self.commits[idx];
-                    let gr = &self.graph_rows[idx];
-                    let row_offset = (idx - row_range.start) as f32;
-                    let y_center = top_left.y + row_offset * row_height + row_height / 2.0;
-                    let y_top = y_center - row_height / 2.0;
-                    let y_bottom = y_center + row_height / 2.0;
+                    for idx in row_range.clone() {
+                        let commit = &self.commits[idx];
+                        let gr = &self.graph_rows[idx];
+                        let row_offset = (idx - row_range.start) as f32;
+                        let y_center = top_left.y + row_offset * row_height + row_height / 2.0;
+                        let y_top = y_center - row_height / 2.0;
+                        let y_bottom = y_center + row_height / 2.0;
 
-                    // Row background
-                    let row_rect = egui::Rect::from_min_size(
-                        egui::pos2(top_left.x, y_top),
-                        egui::vec2(response.rect.width(), row_height),
-                    );
-
-                    if self.selected == Some(idx) {
-                        painter.rect_filled(
-                            row_rect,
-                            0.0,
-                            egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
+                        // Row background
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(top_left.x, y_top),
+                            egui::vec2(response.rect.width(), row_height),
                         );
-                    } else if response.hover_pos().is_some_and(|p| row_rect.contains(p)) {
-                        painter.rect_filled(
-                            row_rect,
-                            0.0,
-                            egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
-                        );
-                    }
 
-                    let gx = |col: usize| -> f32 {
-                        top_left.x + col as f32 * col_width + col_width / 2.0
-                    };
-
-                    // ── Graph ──
-                    // Straight-through lanes
-                    for &(from, to, color_col) in &gr.lines {
-                        if from == to && from != gr.node_col {
-                            let c = graph_color(color_col).linear_multiply(0.5);
-                            painter.line_segment(
-                                [egui::pos2(gx(from), y_top), egui::pos2(gx(to), y_bottom)],
-                                egui::Stroke::new(2.0, c),
+                        if self.selected == Some(idx) {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
+                            );
+                        } else if response.hover_pos().is_some_and(|p| row_rect.contains(p)) {
+                            painter.rect_filled(
+                                row_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
                             );
                         }
-                    }
 
-                    // Incoming line (top → dot)
-                    if idx > 0 {
-                        let prev = &self.graph_rows[idx - 1];
-                        if prev.lines.iter().any(|&(_, to, _)| to == gr.node_col) {
+                        let gx = |col: usize| -> f32 {
+                            top_left.x + col as f32 * col_width + col_width / 2.0
+                        };
+
+                        // ── Graph ──
+                        // Straight-through lanes
+                        for &(from, to, color_col) in &gr.lines {
+                            if from == to && from != gr.node_col {
+                                let c = graph_color(color_col).linear_multiply(0.5);
+                                painter.line_segment(
+                                    [egui::pos2(gx(from), y_top), egui::pos2(gx(to), y_bottom)],
+                                    egui::Stroke::new(2.0, c),
+                                );
+                            }
+                        }
+
+                        // Incoming line (top → dot)
+                        if idx > 0 {
+                            let prev = &self.graph_rows[idx - 1];
+                            if prev.lines.iter().any(|&(_, to, _)| to == gr.node_col) {
+                                let c = graph_color(gr.node_col).linear_multiply(0.7);
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(gx(gr.node_col), y_top),
+                                        egui::pos2(gx(gr.node_col), y_center - dot_radius),
+                                    ],
+                                    egui::Stroke::new(2.0, c),
+                                );
+                            }
+                        }
+
+                        // Outgoing line (dot → bottom)
+                        if gr
+                            .lines
+                            .iter()
+                            .any(|&(f, t, _)| f == gr.node_col && t == gr.node_col)
+                        {
                             let c = graph_color(gr.node_col).linear_multiply(0.7);
                             painter.line_segment(
                                 [
-                                    egui::pos2(gx(gr.node_col), y_top),
-                                    egui::pos2(gx(gr.node_col), y_center - dot_radius),
+                                    egui::pos2(gx(gr.node_col), y_center + dot_radius),
+                                    egui::pos2(gx(gr.node_col), y_bottom),
                                 ],
                                 egui::Stroke::new(2.0, c),
                             );
                         }
-                    }
 
-                    // Outgoing line (dot → bottom)
-                    if gr
-                        .lines
-                        .iter()
-                        .any(|&(f, t, _)| f == gr.node_col && t == gr.node_col)
-                    {
-                        let c = graph_color(gr.node_col).linear_multiply(0.7);
-                        painter.line_segment(
-                            [
-                                egui::pos2(gx(gr.node_col), y_center + dot_radius),
-                                egui::pos2(gx(gr.node_col), y_bottom),
-                            ],
-                            egui::Stroke::new(2.0, c),
-                        );
-                    }
-
-                    // Branch/merge diagonals
-                    for &(from, to, color_col) in &gr.lines {
-                        if from != to {
-                            let c = graph_color(color_col).linear_multiply(0.7);
-                            painter.line_segment(
-                                [egui::pos2(gx(from), y_center), egui::pos2(gx(to), y_bottom)],
-                                egui::Stroke::new(2.0, c),
-                            );
+                        // Branch/merge diagonals
+                        for &(from, to, color_col) in &gr.lines {
+                            if from != to {
+                                let c = graph_color(color_col).linear_multiply(0.7);
+                                painter.line_segment(
+                                    [egui::pos2(gx(from), y_center), egui::pos2(gx(to), y_bottom)],
+                                    egui::Stroke::new(2.0, c),
+                                );
+                            }
                         }
-                    }
 
-                    // Commit dot
-                    painter.circle_filled(
-                        egui::pos2(gx(gr.node_col), y_center),
-                        dot_radius,
-                        graph_color(gr.node_col),
-                    );
-
-                    // ── Text ──
-                    let text_x = top_left.x + graph_width;
-                    let mut cursor_x = text_x;
-
-                    // Ref labels
-                    for (ref_name, kind) in &commit.refs {
-                        let (bg, fg) = match kind {
-                            RefKind::Head => (
-                                egui::Color32::from_rgba_unmultiplied(243, 139, 168, 80),
-                                RED,
-                            ),
-                            RefKind::Branch => (
-                                egui::Color32::from_rgba_unmultiplied(166, 227, 161, 50),
-                                GREEN,
-                            ),
-                            RefKind::Remote => (
-                                egui::Color32::from_rgba_unmultiplied(137, 180, 250, 50),
-                                BLUE,
-                            ),
-                            RefKind::Tag => (
-                                egui::Color32::from_rgba_unmultiplied(249, 226, 175, 50),
-                                YELLOW,
-                            ),
-                        };
-                        let font = egui::FontId::monospace(11.0);
-                        let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
-                        let label_w = galley.size().x + 10.0;
-                        let label_rect = egui::Rect::from_min_size(
-                            egui::pos2(cursor_x, y_center - 8.0),
-                            egui::vec2(label_w, 16.0),
+                        // Commit dot
+                        painter.circle_filled(
+                            egui::pos2(gx(gr.node_col), y_center),
+                            dot_radius,
+                            graph_color(gr.node_col),
                         );
-                        painter.rect_filled(label_rect, 4.0, bg);
-                        painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
-                        cursor_x += label_w + 4.0;
+
+                        // ── Text ──
+                        let text_x = top_left.x + graph_width;
+                        let mut cursor_x = text_x;
+
+                        // Ref labels
+                        for (ref_name, kind) in &commit.refs {
+                            let (bg, fg) = match kind {
+                                RefKind::Head => (
+                                    egui::Color32::from_rgba_unmultiplied(243, 139, 168, 80),
+                                    RED,
+                                ),
+                                RefKind::Branch => (
+                                    egui::Color32::from_rgba_unmultiplied(166, 227, 161, 50),
+                                    GREEN,
+                                ),
+                                RefKind::Remote => (
+                                    egui::Color32::from_rgba_unmultiplied(137, 180, 250, 50),
+                                    BLUE,
+                                ),
+                                RefKind::Tag => (
+                                    egui::Color32::from_rgba_unmultiplied(249, 226, 175, 50),
+                                    YELLOW,
+                                ),
+                            };
+                            let font = egui::FontId::monospace(11.0);
+                            let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
+                            let label_w = galley.size().x + 10.0;
+                            let label_rect = egui::Rect::from_min_size(
+                                egui::pos2(cursor_x, y_center - 8.0),
+                                egui::vec2(label_w, 16.0),
+                            );
+                            painter.rect_filled(label_rect, 4.0, bg);
+                            painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
+                            cursor_x += label_w + 4.0;
+                        }
+
+                        // Summary
+                        let summary_galley = painter.layout_no_wrap(
+                            commit.summary.clone(),
+                            egui::FontId::monospace(13.0),
+                            TEXT,
+                        );
+                        painter.galley(
+                            egui::pos2(cursor_x + 4.0, y_center - 7.0),
+                            summary_galley,
+                            TEXT,
+                        );
+
+                        // Author + date (right-aligned)
+                        let right_x = row_rect.max.x;
+                        let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default();
+                        let date_font = egui::FontId::monospace(12.0);
+                        let date_galley =
+                            painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
+                        let date_w = date_galley.size().x;
+                        painter.galley(
+                            egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
+                            date_galley,
+                            SUBTEXT,
+                        );
+
+                        let a_color = author_color(&commit.author);
+                        let author_galley =
+                            painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
+                        let author_w = author_galley.size().x;
+                        painter.galley(
+                            egui::pos2(right_x - date_w - author_w - 20.0, y_center - 7.0),
+                            author_galley,
+                            a_color,
+                        );
                     }
-
-                    // Summary
-                    let summary_galley = painter.layout_no_wrap(
-                        commit.summary.clone(),
-                        egui::FontId::monospace(13.0),
-                        TEXT,
-                    );
-                    painter.galley(
-                        egui::pos2(cursor_x + 4.0, y_center - 7.0),
-                        summary_galley,
-                        TEXT,
-                    );
-
-                    // Author + date (right-aligned)
-                    let right_x = row_rect.max.x;
-                    let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_default();
-                    let date_font = egui::FontId::monospace(12.0);
-                    let date_galley = painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
-                    let date_w = date_galley.size().x;
-                    painter.galley(
-                        egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
-                        date_galley,
-                        SUBTEXT,
-                    );
-
-                    let a_color = author_color(&commit.author);
-                    let author_galley =
-                        painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
-                    let author_w = author_galley.size().x;
-                    painter.galley(
-                        egui::pos2(right_x - date_w - author_w - 20.0, y_center - 7.0),
-                        author_galley,
-                        a_color,
-                    );
-                }
-            });
+                });
         });
     }
 }
