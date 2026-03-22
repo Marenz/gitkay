@@ -1,15 +1,6 @@
+use eframe::egui;
 use git2::{DiffOptions, Repository, Sort};
-use gtk4::gdk::RGBA;
-use gtk4::glib;
-use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, DrawingArea, Label, ListBox, ListBoxRow,
-    Orientation, Paned, ScrolledWindow, TextView,
-};
-use std::collections::HashMap;
-use std::rc::Rc;
-
-const APP_ID: &str = "com.github.gitkview";
+use std::collections::{HashMap, HashSet};
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -20,7 +11,15 @@ struct CommitInfo {
     author: String,
     time: i64,
     parents: Vec<git2::Oid>,
-    refs: Vec<String>,
+    refs: Vec<(String, RefKind)>,
+}
+
+#[derive(Clone, PartialEq)]
+enum RefKind {
+    Head,
+    Branch,
+    Remote,
+    Tag,
 }
 
 fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
@@ -31,7 +30,6 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
     revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).ok();
     revwalk.push_head().ok();
 
-    // Also push all branches
     if let Ok(branches) = repo.branches(None) {
         for branch in branches.flatten() {
             if let Some(oid) = branch.0.get().target() {
@@ -41,7 +39,7 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
     }
 
     let mut commits = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
 
     for oid in revwalk.flatten() {
         if !seen.insert(oid) {
@@ -65,81 +63,143 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
     commits
 }
 
-fn collect_refs(repo: &Repository, oid: git2::Oid) -> Vec<String> {
+fn collect_refs(repo: &Repository, oid: git2::Oid) -> Vec<(String, RefKind)> {
     let mut refs = Vec::new();
     if let Ok(references) = repo.references() {
         for reference in references.flatten() {
             if reference.target() == Some(oid) {
                 if let Some(shorthand) = reference.shorthand() {
                     let name = reference.name().unwrap_or("");
-                    if name.starts_with("refs/heads/")
-                        || name.starts_with("refs/remotes/")
-                        || name.starts_with("refs/tags/")
-                    {
-                        refs.push(shorthand.to_string());
-                    }
+                    let kind = if name.starts_with("refs/tags/") {
+                        RefKind::Tag
+                    } else if name.starts_with("refs/remotes/") {
+                        RefKind::Remote
+                    } else if name.starts_with("refs/heads/") {
+                        RefKind::Branch
+                    } else {
+                        continue;
+                    };
+                    refs.push((shorthand.to_string(), kind));
                 }
             }
         }
     }
     if let Ok(head) = repo.head() {
-        if head.target() == Some(oid) && !refs.iter().any(|r| r == "HEAD") {
-            refs.insert(0, "HEAD".to_string());
+        if head.target() == Some(oid) {
+            refs.insert(0, ("HEAD".to_string(), RefKind::Head));
         }
     }
     refs
 }
 
-fn get_diff_text(repo: &Repository, oid: git2::Oid) -> String {
+fn get_diff_text(repo: &Repository, oid: git2::Oid) -> Vec<DiffLine> {
     let commit = match repo.find_commit(oid) {
         Ok(c) => c,
-        Err(_) => return String::new(),
+        Err(_) => return Vec::new(),
     };
     let tree = match commit.tree() {
         Ok(t) => t,
-        Err(_) => return String::new(),
+        Err(_) => return Vec::new(),
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
     let mut opts = DiffOptions::new();
     let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
-        Err(_) => return String::new(),
+        Err(_) => return Vec::new(),
     };
 
-    let mut text = String::new();
+    let mut lines = Vec::new();
 
     // Header
-    text.push_str(&format!("commit {}\n", oid));
-    text.push_str(&format!("Author: {}\n", commit.author()));
-    let time = commit.time();
-    if let Some(dt) = chrono::DateTime::from_timestamp(time.seconds(), 0) {
-        text.push_str(&format!("Date:   {}\n", dt.format("%Y-%m-%d %H:%M:%S")));
+    lines.push(DiffLine::new(&format!("commit {}", oid), LineKind::Meta));
+    lines.push(DiffLine::new(
+        &format!("Author: {}", commit.author()),
+        LineKind::Meta,
+    ));
+    if let Some(dt) = chrono::DateTime::from_timestamp(commit.time().seconds(), 0) {
+        lines.push(DiffLine::new(
+            &format!("Date:   {}", dt.format("%Y-%m-%d %H:%M:%S")),
+            LineKind::Meta,
+        ));
     }
-    text.push_str(&format!("\n    {}\n\n", commit.message().unwrap_or("")));
-
-    // Diff stats
-    if let Ok(stats) = diff.stats() {
-        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
-            text.push_str(&format!("{}\n", s.as_str().unwrap_or("")));
+    lines.push(DiffLine::new("", LineKind::Context));
+    if let Some(msg) = commit.message() {
+        for l in msg.lines() {
+            lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
         }
     }
+    lines.push(DiffLine::new("", LineKind::Context));
 
-    // Diff content
+    // Stats
+    if let Ok(stats) = diff.stats() {
+        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
+            for l in s.as_str().unwrap_or("").lines() {
+                lines.push(DiffLine::new(l, LineKind::Stat));
+            }
+        }
+    }
+    lines.push(DiffLine::new("", LineKind::Context));
+
+    // Patch
     diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        let kind = match line.origin() {
+            '+' => LineKind::Add,
+            '-' => LineKind::Del,
+            'H' | 'F' => LineKind::Hunk,
+            _ => {
+                let content = std::str::from_utf8(line.content()).unwrap_or("");
+                if content.starts_with("diff ") || content.starts_with("index ") {
+                    LineKind::FileMeta
+                } else if content.starts_with("--- ") || content.starts_with("+++ ") {
+                    LineKind::FileName
+                } else if content.starts_with("@@") {
+                    LineKind::Hunk
+                } else {
+                    LineKind::Context
+                }
+            }
+        };
         let prefix = match line.origin() {
             '+' => "+",
             '-' => "-",
-            ' ' => " ",
             _ => "",
         };
-        text.push_str(prefix);
-        text.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+        let content = std::str::from_utf8(line.content()).unwrap_or("");
+        let text = format!("{prefix}{}", content.trim_end_matches('\n'));
+        lines.push(DiffLine::new(&text, kind));
         true
     })
     .ok();
 
-    text
+    lines
+}
+
+#[derive(Clone)]
+struct DiffLine {
+    text: String,
+    kind: LineKind,
+}
+
+impl DiffLine {
+    fn new(text: &str, kind: LineKind) -> Self {
+        Self {
+            text: text.to_string(),
+            kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LineKind {
+    Context,
+    Add,
+    Del,
+    Hunk,
+    Meta,
+    FileMeta,
+    FileName,
+    Stat,
 }
 
 // ── Graph layout ─────────────────────────────────────────────────────────
@@ -147,69 +207,51 @@ fn get_diff_text(repo: &Repository, oid: git2::Oid) -> String {
 #[derive(Clone)]
 struct GraphRow {
     node_col: usize,
-    /// (from_col, to_col, color_col) — lines from this row to the next.
-    /// from_col: where the line starts (in this row's column space)
-    /// to_col: where the line ends (in the next row's column space)
-    /// color_col: which column's color to use
+    /// (from_col, to_col, color_col)
     lines: Vec<(usize, usize, usize)>,
     num_cols: usize,
 }
 
 fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
-    // `pipes` tracks what OID each lane is waiting for.
     let mut pipes: Vec<git2::Oid> = Vec::new();
     let mut rows = Vec::new();
-
-    let oid_set: std::collections::HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
+    let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
 
     for commit in commits {
-        // Find which lane this commit lands in
         let node_col = pipes
             .iter()
             .position(|p| *p == commit.oid)
             .unwrap_or_else(|| {
-                // Not expected by any lane — append a new one
                 pipes.push(commit.oid);
                 pipes.len() - 1
             });
 
-        // Snapshot current pipe count for "this row"
         let num_cols_before = pipes.len();
-
-        // Build the next row's pipes by replacing the current commit's lane
-        // with its parents, and keeping all other lanes unchanged.
         let mut next_pipes: Vec<git2::Oid> = Vec::new();
         let mut lines: Vec<(usize, usize, usize)> = Vec::new();
 
-        // Process each current lane
+        // Continue all other lanes
         for (col, &pipe_oid) in pipes.iter().enumerate() {
             if col == node_col {
-                // This is the commit's lane — replace with parents
-                continue; // handled below
+                continue;
             }
-            // Other lanes continue straight
             let next_col = next_pipes.len();
             next_pipes.push(pipe_oid);
             lines.push((col, next_col, col));
         }
 
-        // Now insert the commit's parents at the node's position
+        // Insert parents
         let mut first_parent = true;
         for parent_oid in &commit.parents {
             if !oid_set.contains(parent_oid) {
-                continue; // parent not in our commit list
+                continue;
             }
-            // Check if this parent is already tracked in next_pipes
             if let Some(existing) = next_pipes.iter().position(|p| *p == *parent_oid) {
-                // Merge line: node_col → existing lane
                 lines.push((node_col, existing, node_col));
             } else {
-                // New lane for this parent
                 let target_col = if first_parent {
-                    // Insert first parent at the node's position to keep the graph tight
                     let insert_pos = node_col.min(next_pipes.len());
                     next_pipes.insert(insert_pos, *parent_oid);
-                    // Fix up all line targets that shifted
                     for line in &mut lines {
                         if line.1 >= insert_pos {
                             line.1 += 1;
@@ -232,9 +274,6 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             }
         }
 
-        // If no parents at all (root commit), the lane just ends
-        // (no line from node_col)
-
         rows.push(GraphRow {
             node_col,
             lines,
@@ -247,375 +286,328 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
     rows
 }
 
-// ── Graph colors ─────────────────────────────────────────────────────────
+// ── Colors ───────────────────────────────────────────────────────────────
 
-const GRAPH_COLORS: &[&str] = &[
-    "#cba6f7", "#94e2d5", "#f9e2af", "#a6e3a1", "#f5c2e7", "#89b4fa", "#fab387", "#89dceb",
+const GRAPH_COLORS: &[(u8, u8, u8)] = &[
+    (203, 166, 247), // mauve
+    (148, 226, 213), // teal
+    (249, 226, 175), // yellow
+    (166, 227, 161), // green
+    (245, 194, 231), // pink
+    (137, 180, 250), // blue
+    (250, 179, 135), // peach
+    (137, 220, 235), // sky
 ];
 
-fn color_for_col(col: usize) -> &'static str {
-    GRAPH_COLORS[col % GRAPH_COLORS.len()]
+fn graph_color(col: usize) -> egui::Color32 {
+    let (r, g, b) = GRAPH_COLORS[col % GRAPH_COLORS.len()];
+    egui::Color32::from_rgb(r, g, b)
 }
 
-// ── UI ───────────────────────────────────────────────────────────────────
+// Catppuccin Mocha
+const BG: egui::Color32 = egui::Color32::from_rgb(30, 30, 46);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(205, 214, 244);
+const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(108, 112, 134);
+const SURFACE0: egui::Color32 = egui::Color32::from_rgb(49, 50, 68);
+const MAUVE: egui::Color32 = egui::Color32::from_rgb(203, 166, 247);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
+const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
+const BLUE: egui::Color32 = egui::Color32::from_rgb(137, 180, 250);
+const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
+const TEAL: egui::Color32 = egui::Color32::from_rgb(148, 226, 213);
 
-fn build_ui(app: &Application) {
-    let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
+// ── App state ────────────────────────────────────────────────────────────
 
-    let repo = match Repository::discover(&repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Not a git repository: {e}");
-            std::process::exit(1);
+struct GitkApp {
+    commits: Vec<CommitInfo>,
+    graph_rows: Vec<GraphRow>,
+    selected: Option<usize>,
+    diff_lines: Vec<DiffLine>,
+    repo_path: String,
+}
+
+impl GitkApp {
+    fn new(cc: &eframe::CreationContext<'_>, repo_path: String) -> Self {
+        // Set up dark theme
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.panel_fill = BG;
+        style.visuals.window_fill = BG;
+        style.visuals.extreme_bg_color = BG;
+        style.visuals.faint_bg_color = SURFACE0;
+        style.visuals.override_text_color = Some(TEXT);
+        cc.egui_ctx.set_style(style);
+
+        let repo = Repository::discover(&repo_path).expect("Not a git repository");
+        let commits = load_commits(&repo, 5000);
+        let graph_rows = layout_graph(&commits);
+
+        Self {
+            commits,
+            graph_rows,
+            selected: None,
+            diff_lines: Vec::new(),
+            repo_path,
         }
-    };
-
-    let commits = load_commits(&repo, 2000);
-    let graph_rows = layout_graph(&commits);
-    let max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
-
-    let repo = Rc::new(repo);
-    let commits = Rc::new(commits);
-    let graph_rows = Rc::new(graph_rows);
-
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("gitkview")
-        .default_width(1200)
-        .default_height(800)
-        .build();
-
-    let paned = Paned::new(Orientation::Vertical);
-    paned.set_position(350);
-
-    // ── Top: commit list with graph ──
-    let top_scroll = ScrolledWindow::new();
-    let list_box = ListBox::new();
-    list_box.set_selection_mode(gtk4::SelectionMode::Single);
-    list_box.add_css_class("commit-list");
-
-    let col_width = 12.0_f32;
-    let row_height = 20.0_f32;
-    // Cap visible graph lanes — beyond this, lanes are clipped
-    let max_visible_lanes = 15;
-    let graph_width = (max_visible_lanes as f32 * col_width + 10.0) as i32;
-
-    for (idx, commit) in commits.iter().enumerate() {
-        let row = ListBoxRow::new();
-        let hbox = GtkBox::new(Orientation::Horizontal, 4);
-
-        // Graph column
-        let graph_area = DrawingArea::new();
-        graph_area.set_content_width(graph_width);
-        graph_area.set_content_height(row_height as i32);
-        graph_area.set_overflow(gtk4::Overflow::Visible);
-
-        let graph_rows_clone = graph_rows.clone();
-        graph_area.set_draw_func(move |_area, cr, _w, h| {
-            let gr = &graph_rows_clone[idx];
-            let h = h as f64;
-            let cw = col_width as f64;
-            let node = gr.node_col;
-
-            let set_col = |cr: &gtk4::cairo::Context, col: usize, alpha: f64| {
-                let rgba = RGBA::parse(color_for_col(col)).unwrap_or(RGBA::new(0.8, 0.6, 1.0, 1.0));
-                cr.set_source_rgba(
-                    rgba.red() as f64,
-                    rgba.green() as f64,
-                    rgba.blue() as f64,
-                    alpha,
-                );
-            };
-
-            let x_of = |col: usize| -> f64 { col as f64 * cw + cw / 2.0 };
-            let cy = h / 2.0;
-            cr.set_line_width(2.0);
-            cr.set_line_cap(gtk4::cairo::LineCap::Round);
-            cr.set_line_join(gtk4::cairo::LineJoin::Round);
-
-            // Each line is (from_col, to_col, color_col)
-            for &(from, to, color) in &gr.lines {
-                set_col(cr, color, if from == to { 0.5 } else { 0.7 });
-                let x1 = x_of(from);
-                let x2 = x_of(to);
-
-                if from == to {
-                    // Straight-through lane
-                    if from == node {
-                        // Node's own lane — draw top half and bottom half
-                        // around the dot
-                        cr.move_to(x1, -1.0);
-                        cr.line_to(x1, cy - 4.0);
-                        cr.stroke().ok();
-                        cr.move_to(x1, cy + 4.0);
-                        cr.line_to(x1, h + 1.0);
-                        cr.stroke().ok();
-                    } else {
-                        cr.move_to(x1, -1.0);
-                        cr.line_to(x2, h + 1.0);
-                        cr.stroke().ok();
-                    }
-                } else {
-                    // Branch/merge — smooth curve from node to target lane
-                    cr.move_to(x1, cy);
-                    cr.curve_to(x1, h * 0.85, x2, h * 0.85, x2, h + 1.0);
-                    cr.stroke().ok();
-                }
-            }
-
-            // Draw the incoming line to the dot (from top)
-            if idx > 0 {
-                let prev = &graph_rows_clone[idx - 1];
-                let has_incoming = prev.lines.iter().any(|&(_, to, _)| to == node);
-                if has_incoming {
-                    set_col(cr, node, 0.7);
-                    cr.move_to(x_of(node), -1.0);
-                    cr.line_to(x_of(node), cy - 4.0);
-                    cr.stroke().ok();
-                }
-            }
-
-            // Draw commit dot
-            set_col(cr, node, 1.0);
-            cr.arc(x_of(node), cy, 3.5, 0.0, 2.0 * std::f64::consts::PI);
-            cr.fill().ok();
-        });
-
-        hbox.append(&graph_area);
-
-        // Ref labels
-        for ref_name in &commit.refs {
-            let ref_label = Label::new(Some(ref_name));
-            ref_label.add_css_class("ref-label");
-            if ref_name == "HEAD" {
-                ref_label.add_css_class("ref-head");
-            } else if ref_name.starts_with("origin/") {
-                ref_label.add_css_class("ref-remote");
-            } else {
-                ref_label.add_css_class("ref-branch");
-            }
-            hbox.append(&ref_label);
-        }
-
-        // Summary
-        let summary_label = Label::new(Some(&commit.summary));
-        summary_label.set_xalign(0.0);
-        summary_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        summary_label.set_hexpand(true);
-        summary_label.add_css_class("commit-summary");
-        hbox.append(&summary_label);
-
-        // Author
-        let author_label = Label::new(Some(&commit.author));
-        author_label.add_css_class("commit-author");
-        hbox.append(&author_label);
-
-        // Date
-        let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_default();
-        let date_label = Label::new(Some(&date_str));
-        date_label.add_css_class("commit-date");
-        hbox.append(&date_label);
-
-        row.set_child(Some(&hbox));
-        list_box.append(&row);
     }
+}
 
-    top_scroll.set_child(Some(&list_box));
+impl eframe::App for GitkApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let row_height = 20.0;
+        let col_width = 12.0;
+        let dot_radius = 3.5;
+        let max_graph_cols = 20;
 
-    // ── Bottom: diff view with syntax highlighting ──
-    let diff_scroll = ScrolledWindow::new();
-    let diff_view = TextView::new();
-    diff_view.set_editable(false);
-    diff_view.set_monospace(true);
-    diff_view.set_wrap_mode(gtk4::WrapMode::None);
-    diff_view.add_css_class("diff-view");
-    diff_scroll.set_child(Some(&diff_view));
+        // Split: top = commit list, bottom = diff
+        egui::TopBottomPanel::bottom("diff_panel")
+            .resizable(true)
+            .min_height(100.0)
+            .default_height(300.0)
+            .show(ctx, |ui| {
+                ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
+                egui::ScrollArea::both().show(ui, |ui| {
+                    for line in &self.diff_lines {
+                        let color = match line.kind {
+                            LineKind::Add => GREEN,
+                            LineKind::Del => RED,
+                            LineKind::Hunk => BLUE,
+                            LineKind::Meta => MAUVE,
+                            LineKind::FileMeta => MAUVE,
+                            LineKind::FileName => YELLOW,
+                            LineKind::Stat => SUBTEXT,
+                            LineKind::Context => TEXT,
+                        };
+                        ui.colored_label(color, &line.text);
+                    }
+                });
+            });
 
-    let diff_buffer = diff_view.buffer();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let num_commits = self.commits.len();
+            let graph_width = (self
+                .graph_rows
+                .iter()
+                .map(|r| r.num_cols)
+                .max()
+                .unwrap_or(1)
+                .min(max_graph_cols) as f32)
+                * col_width
+                + 8.0;
 
-    // Create text tags for diff highlighting
-    let tag_table = diff_buffer.tag_table();
+            egui::ScrollArea::vertical().show_rows(ui, row_height, num_commits, |ui, row_range| {
+                // Get the paint area for the graph
+                let top_left = ui.cursor().min;
 
-    let tag_add = gtk4::TextTag::builder()
-        .name("add")
-        .foreground("#a6e3a1")
-        .build();
-    let tag_del = gtk4::TextTag::builder()
-        .name("del")
-        .foreground("#f38ba8")
-        .build();
-    let tag_hunk = gtk4::TextTag::builder()
-        .name("hunk")
-        .foreground("#89b4fa")
-        .build();
-    let tag_meta = gtk4::TextTag::builder()
-        .name("meta")
-        .foreground("#cba6f7")
-        .weight(700)
-        .build();
-    let tag_file = gtk4::TextTag::builder()
-        .name("file")
-        .foreground("#f9e2af")
-        .weight(700)
-        .build();
-    let tag_stat = gtk4::TextTag::builder()
-        .name("stat")
-        .foreground("#6c7086")
-        .build();
+                // Draw all visible rows
+                let painter = ui.painter().clone();
 
-    tag_table.add(&tag_add);
-    tag_table.add(&tag_del);
-    tag_table.add(&tag_hunk);
-    tag_table.add(&tag_meta);
-    tag_table.add(&tag_file);
-    tag_table.add(&tag_stat);
+                for idx in row_range.clone() {
+                    let commit = &self.commits[idx];
+                    let gr = &self.graph_rows[idx];
+                    let y_center =
+                        top_left.y + (idx - row_range.start) as f32 * row_height + row_height / 2.0;
+                    let y_top = y_center - row_height / 2.0;
+                    let y_bottom = y_center + row_height / 2.0;
 
-    // Selection handler — show diff for selected commit with highlighting
-    let repo_clone = repo.clone();
-    let commits_clone = commits.clone();
-    list_box.connect_row_selected(move |_, row| {
-        if let Some(row) = row {
-            let idx = row.index() as usize;
-            if let Some(commit) = commits_clone.get(idx) {
-                let text = get_diff_text(&repo_clone, commit.oid);
-                diff_buffer.set_text("");
+                    // Row background (selection / hover)
+                    let row_rect = egui::Rect::from_min_size(
+                        egui::pos2(top_left.x, y_top),
+                        egui::vec2(ui.available_width(), row_height),
+                    );
 
-                for line in text.lines() {
-                    let end = diff_buffer.end_iter();
-                    let offset = end.offset();
-                    diff_buffer.insert(&mut diff_buffer.end_iter(), line);
-                    diff_buffer.insert(&mut diff_buffer.end_iter(), "\n");
+                    let is_selected = self.selected == Some(idx);
+                    if is_selected {
+                        painter.rect_filled(
+                            row_rect,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
+                        );
+                    }
 
-                    let start = diff_buffer.iter_at_offset(offset);
-                    let end = diff_buffer.end_iter();
+                    // Click detection
+                    let response = ui.allocate_rect(row_rect, egui::Sense::click());
+                    if response.clicked() {
+                        self.selected = Some(idx);
+                        let repo = Repository::discover(&self.repo_path).unwrap();
+                        self.diff_lines = get_diff_text(&repo, commit.oid);
+                    }
+                    if response.hovered() && !is_selected {
+                        painter.rect_filled(
+                            row_rect,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
+                        );
+                    }
 
-                    let tag_name = if line.starts_with('+') && !line.starts_with("+++") {
-                        Some("add")
-                    } else if line.starts_with('-') && !line.starts_with("---") {
-                        Some("del")
-                    } else if line.starts_with("@@") {
-                        Some("hunk")
-                    } else if line.starts_with("diff ") || line.starts_with("index ") {
-                        Some("meta")
-                    } else if line.starts_with("--- ") || line.starts_with("+++ ") {
-                        Some("file")
-                    } else if line.starts_with("commit ")
-                        || line.starts_with("Author:")
-                        || line.starts_with("Date:")
-                    {
-                        Some("meta")
-                    } else if line.contains(" | ")
-                        && (line.contains(" +") || line.contains(" -") || line.ends_with("Bin"))
-                    {
-                        Some("stat")
-                    } else {
-                        None
+                    let gx = |col: usize| -> f32 {
+                        top_left.x + col as f32 * col_width + col_width / 2.0
                     };
 
-                    if let Some(tag) = tag_name {
-                        diff_buffer.apply_tag_by_name(tag, &start, &end);
+                    // ── Graph: straight-through lanes ──
+                    for &(from, to, color_col) in &gr.lines {
+                        if from == to && from != gr.node_col {
+                            let x = gx(from);
+                            let c = graph_color(color_col).linear_multiply(0.5);
+                            painter.line_segment(
+                                [egui::pos2(x, y_top), egui::pos2(x, y_bottom)],
+                                egui::Stroke::new(2.0, c),
+                            );
+                        }
                     }
+
+                    // ── Graph: incoming line (top → dot) ──
+                    if idx > 0 {
+                        let prev = &self.graph_rows[idx - 1];
+                        if prev.lines.iter().any(|&(_, to, _)| to == gr.node_col) {
+                            let x = gx(gr.node_col);
+                            let c = graph_color(gr.node_col).linear_multiply(0.7);
+                            painter.line_segment(
+                                [egui::pos2(x, y_top), egui::pos2(x, y_center - dot_radius)],
+                                egui::Stroke::new(2.0, c),
+                            );
+                        }
+                    }
+
+                    // ── Graph: outgoing line (dot → bottom) ──
+                    if gr
+                        .lines
+                        .iter()
+                        .any(|&(f, t, _)| f == gr.node_col && t == gr.node_col)
+                    {
+                        let x = gx(gr.node_col);
+                        let c = graph_color(gr.node_col).linear_multiply(0.7);
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, y_center + dot_radius),
+                                egui::pos2(x, y_bottom),
+                            ],
+                            egui::Stroke::new(2.0, c),
+                        );
+                    }
+
+                    // ── Graph: branch/merge diagonals ──
+                    for &(from, to, color_col) in &gr.lines {
+                        if from != to {
+                            let c = graph_color(color_col).linear_multiply(0.7);
+                            painter.line_segment(
+                                [egui::pos2(gx(from), y_center), egui::pos2(gx(to), y_bottom)],
+                                egui::Stroke::new(2.0, c),
+                            );
+                        }
+                    }
+
+                    // ── Graph: commit dot ──
+                    let dot_color = graph_color(gr.node_col);
+                    painter.circle_filled(
+                        egui::pos2(gx(gr.node_col), y_center),
+                        dot_radius,
+                        dot_color,
+                    );
+
+                    // ── Text: refs, summary, author, date ──
+                    let text_x = top_left.x + graph_width;
+                    let mut cursor_x = text_x;
+
+                    // Ref labels
+                    for (ref_name, kind) in &commit.refs {
+                        let (bg, fg) = match kind {
+                            RefKind::Head => (
+                                egui::Color32::from_rgba_unmultiplied(243, 139, 168, 80),
+                                RED,
+                            ),
+                            RefKind::Branch => (
+                                egui::Color32::from_rgba_unmultiplied(166, 227, 161, 50),
+                                GREEN,
+                            ),
+                            RefKind::Remote => (
+                                egui::Color32::from_rgba_unmultiplied(137, 180, 250, 50),
+                                BLUE,
+                            ),
+                            RefKind::Tag => (
+                                egui::Color32::from_rgba_unmultiplied(249, 226, 175, 50),
+                                YELLOW,
+                            ),
+                        };
+                        let font = egui::FontId::monospace(11.0);
+                        let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
+                        let label_w = galley.size().x + 10.0;
+                        let label_rect = egui::Rect::from_min_size(
+                            egui::pos2(cursor_x, y_center - 8.0),
+                            egui::vec2(label_w, 16.0),
+                        );
+                        painter.rect_filled(label_rect, 4.0, bg);
+                        painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
+                        cursor_x += label_w + 4.0;
+                    }
+
+                    // Summary
+                    let summary_font = egui::FontId::monospace(13.0);
+                    let summary_galley =
+                        painter.layout_no_wrap(commit.summary.clone(), summary_font, TEXT);
+                    painter.galley(
+                        egui::pos2(cursor_x + 4.0, y_center - 7.0),
+                        summary_galley,
+                        TEXT,
+                    );
+
+                    // Author (right-aligned area)
+                    let right_x = row_rect.max.x;
+                    let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    let date_font = egui::FontId::monospace(12.0);
+                    let date_galley = painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
+                    let date_w = date_galley.size().x;
+                    painter.galley(
+                        egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
+                        date_galley,
+                        SUBTEXT,
+                    );
+
+                    let author_galley =
+                        painter.layout_no_wrap(commit.author.clone(), date_font, TEAL);
+                    let author_w = author_galley.size().x;
+                    painter.galley(
+                        egui::pos2(right_x - date_w - author_w - 20.0, y_center - 7.0),
+                        author_galley,
+                        TEAL,
+                    );
                 }
-            }
-        }
-    });
-
-    paned.set_start_child(Some(&top_scroll));
-    paned.set_end_child(Some(&diff_scroll));
-    window.set_child(Some(&paned));
-
-    // ── CSS: Catppuccin Mocha ──
-    let css = gtk4::CssProvider::new();
-    css.load_from_data(
-        r#"
-        window {
-            background-color: #1e1e2e;
-            color: #cdd6f4;
-        }
-        .commit-list row {
-            padding: 0px 8px;
-            margin: 0;
-            min-height: 20px;
-            border-spacing: 0;
-        }
-        .commit-list {
-            border-spacing: 0;
-        }
-        .commit-list row:selected {
-            background-color: rgba(203, 166, 247, 0.2);
-        }
-        .commit-list row:hover {
-            background-color: rgba(203, 166, 247, 0.08);
-        }
-        .commit-summary {
-            color: #cdd6f4;
-            font-family: monospace;
-            font-size: 13px;
-        }
-        .commit-author {
-            color: #94e2d5;
-            font-family: monospace;
-            font-size: 12px;
-            margin-left: 12px;
-            min-width: 120px;
-        }
-        .commit-date {
-            color: #6c7086;
-            font-family: monospace;
-            font-size: 12px;
-            margin-left: 8px;
-            min-width: 130px;
-        }
-        .ref-label {
-            font-family: monospace;
-            font-size: 11px;
-            font-weight: bold;
-            padding: 1px 6px;
-            margin: 0 2px;
-            border-radius: 4px;
-        }
-        .ref-head {
-            background-color: rgba(243, 139, 168, 0.3);
-            color: #f38ba8;
-        }
-        .ref-branch {
-            background-color: rgba(166, 227, 161, 0.2);
-            color: #a6e3a1;
-        }
-        .ref-remote {
-            background-color: rgba(137, 180, 250, 0.2);
-            color: #89b4fa;
-        }
-        .diff-view {
-            background-color: #1e1e2e;
-            color: #cdd6f4;
-            font-family: monospace;
-            font-size: 13px;
-        }
-        textview text {
-            background-color: #1e1e2e;
-            color: #cdd6f4;
-        }
-    "#,
-    );
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().unwrap(),
-        &css,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-
-    // Select first commit
-    if let Some(first_row) = list_box.row_at_index(0) {
-        list_box.select_row(Some(&first_row));
+            });
+        });
     }
-
-    window.present();
 }
 
-fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
-    app.run()
+fn main() -> eframe::Result {
+    let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
+
+    // Verify repo exists before launching UI
+    if Repository::discover(&repo_path).is_err() {
+        eprintln!("Not a git repository: {repo_path}");
+        std::process::exit(1);
+    }
+
+    let title = {
+        let repo = Repository::discover(&repo_path).unwrap();
+        let workdir = repo
+            .workdir()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("gitkview");
+        format!("gitkview — {workdir}")
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_title(&title),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |cc| Ok(Box::new(GitkApp::new(cc, repo_path)))),
+    )
 }
