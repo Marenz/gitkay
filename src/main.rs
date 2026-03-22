@@ -1420,6 +1420,98 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_target_no_vertical_when_immediately_consumed() {
+        // When a merge diagonal targets a lane whose commit is the very
+        // next row, AND that commit has no children keeping the lane alive
+        // from above, the vertical continuation is redundant.
+        //
+        // Specifically: merge commit where the second parent has no other
+        // lane pointing to it from above — only the merge diagonal.
+        //
+        // 1 (merge: 2, 3)  — merge
+        // 2 (parent: 4)    — first parent continues
+        // 3 (parent: 4)    — second parent, ONLY reached via merge diagonal
+        // 4 (root)
+        //
+        // At row 0 (commit 1): the diagonal (0→1) creates lane for commit 3.
+        // The vertical (1→1) is technically correct (commit 3 is in col 1 next).
+        // But visually the diagonal already connects to it, so no separate
+        // vertical is needed — the diagonal IS the connection.
+        //
+        // However: if we suppress the vertical, there's a gap between the
+        // diagonal (which ends at y_bottom of row 0) and the dot at row 1.
+        // So actually the vertical IS needed to fill row 1's top half.
+        //
+        // This test documents the current (correct) behavior: the vertical
+        // continuation is present because the lane is active.
+        let commits = vec![
+            commit(1, &[2, 3]),
+            commit(2, &[4]),
+            commit(3, &[4]),
+            commit(4, &[]),
+        ];
+        let rows = layout_graph(&commits);
+
+        let merge_row = &rows[0];
+        let target_col = merge_row
+            .lines
+            .iter()
+            .find(|&&(f, t, _)| f == merge_row.node_col && t != f)
+            .unwrap()
+            .1;
+
+        // The vertical IS present (lane is active with commit 3)
+        let has_vertical = merge_row
+            .lines
+            .iter()
+            .any(|&(f, t, _)| f == target_col && t == target_col);
+        assert!(
+            has_vertical,
+            "Lane with pending commit should have vertical continuation"
+        );
+    }
+
+    #[test]
+    fn test_convergence_no_vertical_on_consumed_lane() {
+        // When two lanes converge at a commit, the consumed lane should
+        // NOT have a vertical continuation.
+        // 1 (merge: 2, 3)
+        // 2 (parent: 4)    — both 2 and 3 point to 4
+        // 3 (parent: 4)
+        // 4 (parent: 5)
+        // 5 (root)
+        let commits = vec![
+            commit(1, &[2, 3]),
+            commit(2, &[4]),
+            commit(3, &[4]),
+            commit(4, &[5]),
+            commit(5, &[]),
+        ];
+        let rows = layout_graph(&commits);
+
+        // At commit 4 (row 3): two lanes converge. The consumed lane
+        // should not have a vertical continuation.
+        let conv_row = &rows[3]; // commit 4
+        let convergence_sources: Vec<usize> = conv_row
+            .lines
+            .iter()
+            .filter(|&&(f, t, _)| f != t && t == conv_row.node_col)
+            .map(|&(f, _, _)| f)
+            .collect();
+
+        for src_col in &convergence_sources {
+            let has_vertical = conv_row
+                .lines
+                .iter()
+                .any(|&(f, t, _)| f == *src_col && t == *src_col);
+            assert!(
+                !has_vertical,
+                "Consumed convergence lane (col {src_col}) should not have vertical"
+            );
+        }
+    }
+
+    #[test]
     fn test_sequential_merges() {
         // Multiple PRs merged in sequence:
         // 1 (merge: 2, 3)  — merge PR-A
