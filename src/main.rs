@@ -1249,14 +1249,7 @@ impl eframe::App for GitkApp {
                         let is_staged = commit.oid == oid_staged();
                         let is_branch_member = self.branch_highlight.contains(&idx);
 
-                        // Row background layers: branch → virtual → selection/search/hover
-                        if is_branch_member && self.selected != Some(idx) {
-                            painter.rect_filled(
-                                row_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 5),
-                            );
-                        }
+                        // Branch members: no background, handled via brighter text below
                         if is_uncommitted {
                             painter.rect_filled(
                                 row_rect,
@@ -1430,9 +1423,17 @@ impl eframe::App for GitkApp {
 
                         // Summary — truncate to available space before author
                         let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
+                        let summary_color = if is_branch_member && self.selected != Some(idx) {
+                            egui::Color32::from_rgb(230, 235, 255) // slightly brighter
+                        } else {
+                            TEXT
+                        };
                         let summary_font = egui::FontId::monospace(13.0);
-                        let summary_galley =
-                            painter.layout_no_wrap(commit.summary.clone(), summary_font, TEXT);
+                        let summary_galley = painter.layout_no_wrap(
+                            commit.summary.clone(),
+                            summary_font,
+                            summary_color,
+                        );
                         // Clip to not overflow into author/date
                         let summary_clip = egui::Rect::from_min_max(
                             egui::pos2(cursor_x + 4.0, y_top),
