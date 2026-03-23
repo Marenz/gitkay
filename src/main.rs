@@ -1019,17 +1019,11 @@ impl eframe::App for GitkApp {
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
-                            let mut scroll = egui::ScrollArea::both().id_salt("diff_scroll");
-
-                            if let Some(target_line) = self.diff_scroll_to.take() {
-                                // Line height = font size + item spacing
-                                let line_height = 13.0 + ui.spacing().item_spacing.y;
-                                let target_y = target_line as f32 * line_height;
-                                scroll = scroll.vertical_scroll_offset(target_y);
-                            }
+                            let scroll = egui::ScrollArea::both().id_salt("diff_scroll");
+                            let scroll_target = self.diff_scroll_to.take();
 
                             scroll.show(ui, |ui| {
-                                for line in &self.diff_lines {
+                                for (i, line) in self.diff_lines.iter().enumerate() {
                                     let color = match line.kind {
                                         LineKind::Add => GREEN,
                                         LineKind::Del => RED,
@@ -1040,7 +1034,10 @@ impl eframe::App for GitkApp {
                                         LineKind::Stat => SUBTEXT,
                                         LineKind::Context => TEXT,
                                     };
-                                    ui.colored_label(color, &line.text);
+                                    let resp = ui.colored_label(color, &line.text);
+                                    if scroll_target == Some(i) {
+                                        resp.scroll_to_me(Some(egui::Align::TOP));
+                                    }
                                 }
                             });
                         },
