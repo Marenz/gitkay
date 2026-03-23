@@ -52,15 +52,12 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
         .ok()
         .is_some_and(|_| {
             // Actually: staged = index vs HEAD tree
-            if let Some(head) = head_oid {
-                if let Ok(head_commit) = repo.find_commit(head) {
-                    if let Ok(head_tree) = head_commit.tree() {
-                        if let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None) {
+            if let Some(head) = head_oid
+                && let Ok(head_commit) = repo.find_commit(head)
+                    && let Ok(head_tree) = head_commit.tree()
+                        && let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None) {
                             return diff.deltas().len() > 0;
                         }
-                    }
-                }
-            }
             false
         });
 
@@ -297,13 +294,12 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Stats
-    if let Ok(stats) = diff.stats() {
-        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
+    if let Ok(stats) = diff.stats()
+        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
             for l in s.as_str().unwrap_or("").lines() {
                 lines.push(DiffLine::new(l, LineKind::Stat));
             }
         }
-    }
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch — track which file we're in
@@ -433,13 +429,12 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
     }
 
     // Stats
-    if let Ok(stats) = diff.stats() {
-        if let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
+    if let Ok(stats) = diff.stats()
+        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
             for l in s.as_str().unwrap_or("").lines() {
                 lines.push(DiffLine::new(l, LineKind::Stat));
             }
         }
-    }
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch
@@ -875,8 +870,8 @@ impl GitkApp {
 impl eframe::App for GitkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Auto-reload when git refs change
-        if self.needs_reload.swap(false, Ordering::Relaxed) {
-            if let Ok(repo) = Repository::discover(&self.repo_path) {
+        if self.needs_reload.swap(false, Ordering::Relaxed)
+            && let Ok(repo) = Repository::discover(&self.repo_path) {
                 let count = self.commits.len().max(200);
                 self.commits = load_commits(&repo, count);
                 self.graph_rows = layout_graph(&self.commits);
@@ -898,15 +893,13 @@ impl eframe::App for GitkApp {
                         .collect();
                 }
                 // Reload diff if a commit is selected
-                if let Some(sel) = self.selected {
-                    if sel < self.commits.len() {
+                if let Some(sel) = self.selected
+                    && sel < self.commits.len() {
                         let data = get_diff_data(&repo, self.commits[sel].oid);
                         self.diff_lines = data.lines;
                         self.diff_files = data.files;
                     }
-                }
             }
-        }
 
         let row_height = 20.0;
         let col_width = 12.0;
@@ -1194,8 +1187,8 @@ impl eframe::App for GitkApp {
                     let top_left = response.rect.min;
 
                     // Check click — select commit and copy SHA
-                    if response.clicked() {
-                        if let Some(pos) = response.interact_pointer_pos() {
+                    if response.clicked()
+                        && let Some(pos) = response.interact_pointer_pos() {
                             let row_offset = ((pos.y - top_left.y) / row_height) as usize;
                             let clicked_idx = row_range.start + row_offset;
                             if clicked_idx < num_commits {
@@ -1227,7 +1220,6 @@ impl eframe::App for GitkApp {
                                 self.diff_files = data.files;
                             }
                         }
-                    }
 
                     for idx in row_range.clone() {
                         let commit = &self.commits[idx];
