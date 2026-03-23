@@ -1019,7 +1019,9 @@ impl eframe::App for GitkApp {
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
-                            let scroll = egui::ScrollArea::both().id_salt("diff_scroll");
+                            let scroll = egui::ScrollArea::both()
+                                .id_salt("diff_scroll")
+                                .animated(false);
                             let scroll_target = self.diff_scroll_to.take();
 
                             scroll.show(ui, |ui| {
@@ -1036,7 +1038,7 @@ impl eframe::App for GitkApp {
                                     };
                                     let resp = ui.colored_label(color, &line.text);
                                     if scroll_target == Some(i) {
-                                        resp.scroll_to_me(Some(egui::Align::TOP));
+                                        ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
                                     }
                                 }
                             });
