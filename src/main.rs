@@ -1423,10 +1423,11 @@ impl eframe::App for GitkApp {
 
                         // Summary — truncate to available space before author
                         let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
-                        let summary_color = if is_branch_member && self.selected != Some(idx) {
-                            egui::Color32::from_rgb(230, 235, 255) // slightly brighter
-                        } else {
+                        let has_highlight = !self.branch_highlight.is_empty();
+                        let summary_color = if !has_highlight || is_branch_member {
                             TEXT
+                        } else {
+                            SUBTEXT // dim non-branch commits
                         };
                         let summary_font = egui::FontId::monospace(13.0);
                         let summary_galley = painter.layout_no_wrap(
