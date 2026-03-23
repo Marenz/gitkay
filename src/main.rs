@@ -1254,7 +1254,7 @@ impl eframe::App for GitkApp {
                             painter.rect_filled(
                                 row_rect,
                                 0.0,
-                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 8),
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 5),
                             );
                         }
                         if is_uncommitted {
@@ -1411,12 +1411,22 @@ impl eframe::App for GitkApp {
                             painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
                         let date_w = date_galley.size().x;
 
+                        // Short SHA
+                        let short_sha = if is_virtual_oid(commit.oid) {
+                            String::new()
+                        } else {
+                            format!("{:.7}", commit.oid)
+                        };
+                        let sha_galley =
+                            painter.layout_no_wrap(short_sha, date_font.clone(), SUBTEXT);
+                        let sha_w = sha_galley.size().x;
+
                         let a_color = author_color(&commit.author);
                         let author_galley =
                             painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
                         let author_w = author_galley.size().x;
 
-                        let author_date_x = right_x - date_w - author_w - 28.0;
+                        let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
 
                         // Summary — truncate to available space before author
                         let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
@@ -1434,12 +1444,13 @@ impl eframe::App for GitkApp {
                             TEXT,
                         );
 
-                        // Draw author + date
-                        painter.galley(
-                            egui::pos2(author_date_x, y_center - 7.0),
-                            author_galley,
-                            a_color,
-                        );
+                        // Draw SHA, author, date (right-aligned)
+                        let mut rx = author_date_x;
+                        if sha_w > 0.0 {
+                            painter.galley(egui::pos2(rx, y_center - 7.0), sha_galley, SUBTEXT);
+                            rx += sha_w + 8.0;
+                        }
+                        painter.galley(egui::pos2(rx, y_center - 7.0), author_galley, a_color);
                         painter.galley(
                             egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
                             date_galley,
