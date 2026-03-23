@@ -821,12 +821,33 @@ impl GitkApp {
                 })
                 .ok();
             if let Some(ref mut w) = watcher {
-                // Watch refs (branches, tags, remotes)
-                let _ = w.watch(&git_dir.join("refs"), RecursiveMode::Recursive);
-                // Watch HEAD (checkout, rebase)
+                // Watch worktree-specific files
                 let _ = w.watch(&git_dir.join("HEAD"), RecursiveMode::NonRecursive);
-                // Watch index (staging changes)
                 let _ = w.watch(&git_dir.join("index"), RecursiveMode::NonRecursive);
+
+                // Watch refs — in a worktree, refs live in the main repo's
+                // .git dir (commondir), not the worktree's .git dir.
+                let common_dir = git_dir.join("commondir");
+                let refs_dir = if common_dir.exists() {
+                    // Worktree: commondir file contains path to the main .git
+                    if let Ok(content) = std::fs::read_to_string(&common_dir) {
+                        let p = content.trim();
+                        if std::path::Path::new(p).is_absolute() {
+                            std::path::PathBuf::from(p)
+                        } else {
+                            git_dir.join(p)
+                        }
+                    } else {
+                        git_dir.clone()
+                    }
+                } else {
+                    git_dir.clone()
+                };
+                let _ = w.watch(&refs_dir.join("refs"), RecursiveMode::Recursive);
+                let _ = w.watch(&refs_dir.join("packed-refs"), RecursiveMode::NonRecursive);
+                if refs_dir != git_dir {
+                    let _ = w.watch(&refs_dir.join("HEAD"), RecursiveMode::NonRecursive);
+                }
             }
             watcher
         };
@@ -1275,63 +1296,12 @@ impl eframe::App for GitkApp {
                         };
 
                         // ── Graph ──
-                        // Check if this row is part of the highlighted branch
-                        let row_highlighted = is_branch_member
-                            && idx + 1 < self.commits.len()
-                            && self.branch_highlight.contains(&(idx + 1));
-
                         for &(from, to, color_col) in &gr.lines {
-                            // An edge is on the highlighted branch if:
-                            // - This row is highlighted AND
-                            // - The edge connects through the node column (it's the branch's lane)
-                            let edge_highlighted = row_highlighted
-                                && (from == gr.node_col || to == gr.node_col)
-                                && from == to; // only straight continuations, not merge diags
-
-                            let base_alpha = if from == to { 0.5 } else { 0.7 };
-                            let c = graph_color(color_col).linear_multiply(if edge_highlighted {
-                                1.0
+                            let c = graph_color(color_col).linear_multiply(if from == to {
+                                0.5
                             } else {
-                                base_alpha
+                                0.7
                             });
-
-                            // Draw glow behind highlighted edges
-                            if edge_highlighted {
-                                let glow_c = graph_color(color_col).linear_multiply(0.3);
-                                let glow_stroke = egui::Stroke::new(8.0, glow_c);
-                                // Pre-draw the glow (same geometry, wider stroke)
-                                let x_top = gx(from);
-                                let x_bot = gx(to);
-                                if from == to && from == gr.node_col {
-                                    let has_incoming = idx > 0
-                                        && self.graph_rows[idx - 1]
-                                            .lines
-                                            .iter()
-                                            .any(|&(_, t, _)| t == gr.node_col);
-                                    if has_incoming {
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(x_top, y_top),
-                                                egui::pos2(x_top, y_center - dot_radius - 1.0),
-                                            ],
-                                            glow_stroke,
-                                        );
-                                    }
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(x_bot, y_center + dot_radius + 1.0),
-                                            egui::pos2(x_bot, y_bottom),
-                                        ],
-                                        glow_stroke,
-                                    );
-                                } else {
-                                    painter.line_segment(
-                                        [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
-                                        glow_stroke,
-                                    );
-                                }
-                            }
-
                             let stroke = egui::Stroke::new(2.0, c);
                             let x_top = gx(from);
                             let x_bot = gx(to);
