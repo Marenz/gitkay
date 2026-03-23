@@ -1191,8 +1191,15 @@ impl eframe::App for GitkApp {
                                         .text(&sha);
                                 }
                                 self.copied_toast = Some(std::time::Instant::now());
-                                self.branch_highlight =
+                                let highlight =
                                     compute_branch_highlight(&self.commits, clicked_idx);
+                                // Only show highlight if there are multiple branches
+                                // (if highlight covers all commits, there's only one branch)
+                                self.branch_highlight = if highlight.len() < self.commits.len() {
+                                    highlight
+                                } else {
+                                    HashSet::new()
+                                };
                                 let repo = Repository::discover(&self.repo_path).unwrap();
                                 let data = get_diff_data(&repo, commit.oid);
                                 self.diff_lines = data.lines;
@@ -1268,14 +1275,63 @@ impl eframe::App for GitkApp {
                         };
 
                         // ── Graph ──
-                        // Each edge (from, to, color) represents a line in this
-                        // row from column `from` at y_top to column `to` at y_bottom.
+                        // Check if this row is part of the highlighted branch
+                        let row_highlighted = is_branch_member
+                            && idx + 1 < self.commits.len()
+                            && self.branch_highlight.contains(&(idx + 1));
+
                         for &(from, to, color_col) in &gr.lines {
-                            let c = graph_color(color_col).linear_multiply(if from == to {
-                                0.5
+                            // An edge is on the highlighted branch if:
+                            // - This row is highlighted AND
+                            // - The edge connects through the node column (it's the branch's lane)
+                            let edge_highlighted = row_highlighted
+                                && (from == gr.node_col || to == gr.node_col)
+                                && from == to; // only straight continuations, not merge diags
+
+                            let base_alpha = if from == to { 0.5 } else { 0.7 };
+                            let c = graph_color(color_col).linear_multiply(if edge_highlighted {
+                                1.0
                             } else {
-                                0.7
+                                base_alpha
                             });
+
+                            // Draw glow behind highlighted edges
+                            if edge_highlighted {
+                                let glow_c = graph_color(color_col).linear_multiply(0.3);
+                                let glow_stroke = egui::Stroke::new(8.0, glow_c);
+                                // Pre-draw the glow (same geometry, wider stroke)
+                                let x_top = gx(from);
+                                let x_bot = gx(to);
+                                if from == to && from == gr.node_col {
+                                    let has_incoming = idx > 0
+                                        && self.graph_rows[idx - 1]
+                                            .lines
+                                            .iter()
+                                            .any(|&(_, t, _)| t == gr.node_col);
+                                    if has_incoming {
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(x_top, y_top),
+                                                egui::pos2(x_top, y_center - dot_radius - 1.0),
+                                            ],
+                                            glow_stroke,
+                                        );
+                                    }
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(x_bot, y_center + dot_radius + 1.0),
+                                            egui::pos2(x_bot, y_bottom),
+                                        ],
+                                        glow_stroke,
+                                    );
+                                } else {
+                                    painter.line_segment(
+                                        [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
+                                        glow_stroke,
+                                    );
+                                }
+                            }
+
                             let stroke = egui::Stroke::new(2.0, c);
                             let x_top = gx(from);
                             let x_bot = gx(to);
