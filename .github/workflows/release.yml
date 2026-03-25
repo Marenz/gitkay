@@ -77,15 +77,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm
-          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-          # Create source tarball from the pre-built binary
-          mkdir -p gitkay-${{ github.ref_name }}
-          tar xzf gitkay-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz -C gitkay-${{ github.ref_name }}
-          cp LICENSE README.md gitkay-${{ github.ref_name }}/
-          tar czf rpmbuild/SOURCES/gitkay-${{ github.ref_name }}.tar.gz gitkay-${{ github.ref_name }}
-          # Build RPM from pre-compiled binary
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p gitkay-${VERSION}
+          tar xzf gitkay-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz -C gitkay-${VERSION}
+          cp LICENSE README.md gitkay-${VERSION}/
+          tar czf rpmbuild/SOURCES/gitkay-${VERSION}.tar.gz gitkay-${VERSION}
           cat > rpmbuild/SPECS/gitkay.spec << 'SPEC'
           Name:           gitkay
           Version:        VERSION_PLACEHOLDER
@@ -93,14 +91,14 @@ jobs:
           Summary:        A fast, native Wayland git history viewer
           License:        MIT
           URL:            https://github.com/Marenz/gitkay
-          Source0:        gitkay-%{version}.tar.gz
+          Source0:        gitkay-VERSION_PLACEHOLDER.tar.gz
           AutoReq:        no
 
           %description
           gitkay is a native Wayland git history viewer — gitk, but okay.
 
           %prep
-          %autosetup -n gitkay-v%{version}
+          %autosetup
 
           %install
           install -Dm755 gitkay %{buildroot}%{_bindir}/gitkay
@@ -110,7 +108,7 @@ jobs:
           %doc README.md
           %{_bindir}/gitkay
           SPEC
-          sed -i "s/VERSION_PLACEHOLDER/$VERSION/" rpmbuild/SPECS/gitkay.spec
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" rpmbuild/SPECS/gitkay.spec
           rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/gitkay.spec
 
       - name: Upload RPM
