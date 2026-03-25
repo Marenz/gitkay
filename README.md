@@ -52,8 +52,10 @@
 
 ### Search
 - Full-width search bar — filter by SHA, author, commit message, branch name, tag name
+- **Just start typing** — any keypress focuses the search bar instantly
 - Press **Enter** to cycle through matches with `3/42` counter
-- Matching commits highlighted in the graph
+- Graph auto-scrolls to the matched commit
+- Matching commits marked with a yellow accent bar
 
 ### Quality of Life
 - **Click a commit** to copy its SHA to both clipboard and primary selection
@@ -122,14 +124,14 @@ gitkay /path/to/repo
 |---|---|
 | **Click** commit | Select, show diff, copy SHA to clipboard |
 | **Scroll** | Browse history (lazy loads more commits) |
-| **Type** in search bar | Filter by SHA / author / message / branch / tag |
-| **Enter** in search | Cycle through matches |
+| **Start typing** (anywhere) | Focus search bar and filter by SHA / author / message / branch / tag |
+| **Enter** in search | Cycle through matches, graph scrolls to match |
 | **Click** file in sidebar | Jump to file's diff section |
 | **Hover** file in sidebar | Full path tooltip |
 
 ## Architecture
 
-Single-file Rust app (~1600 lines) with 14 unit tests:
+Single-file Rust app (~2100 lines) with 16 unit tests:
 
 - **egui** + **eframe** — native Wayland window with wgpu rendering
 - **git2** (libgit2) — repository access, revwalk, diff

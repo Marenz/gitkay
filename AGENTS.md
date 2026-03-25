@@ -6,7 +6,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 14 graph layout tests
+cargo test                # 16 graph/highlight tests
 cp target/release/gitkay ~/.local/bin/
 ```
 
@@ -14,7 +14,7 @@ System dependencies (openSUSE): `gtk4-devel libgraphene-devel openssl-devel`
 
 ## Architecture
 
-Single-file app at `src/main.rs` (~1600 lines). Three sections:
+Single-file app at `src/main.rs` (~2100 lines). Three sections:
 
 ### Data Layer
 - `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
@@ -33,14 +33,14 @@ Single-file app at `src/main.rs` (~1600 lines). Three sections:
 - **Color tracking**: per-pipe color index, persists through column shifts
 
 ### UI (egui immediate mode)
-- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches
+- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match
 - **Central panel**: commit graph + list. Manual virtual scrolling (pre-spacer, painter, post-spacer). Lazy loading (200 initial, +500 on scroll-near-bottom)
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width)
 - **Graph rendering**: each edge `(from, to, color)` = one line segment. Lines touching node split around dot. No incoming line for first commits (no parent above)
 - **Text**: summary clipped via `with_clip_rect`. Authors colored by hash. Refs colored by name hash (12-color extended palette)
 - **Clipboard**: SHA copied to both clipboard + primary selection on click
 
-## Tests (14)
+## Tests (16)
 
 All use fake OIDs via `oid(n)` — no real git repo needed.
 
@@ -58,6 +58,8 @@ All use fake OIDs via `oid(n)` — no real git repo needed.
 - `test_merge_into_feature_main_continues` — main vertical persists after merge-into
 - `test_convergence_no_vertical_on_consumed_lane` — consumed lanes: no vertical
 - `test_many_linear_commits_stay_in_column` — 10 linear commits, all col 0
+- `test_parent_not_in_scope_still_has_line` — commits whose parent is outside the loaded window still draw a continuation line
+- `test_merge_highlight_includes_merged_branch_ancestry` — merge selection highlights merged-in ancestry instead of dimming it as a separate branch
 
 ## Common Pitfalls
 
@@ -67,3 +69,5 @@ All use fake OIDs via `oid(n)` — no real git repo needed.
 - Two branches → same parent: both keep lanes, convergence at parent row
 - New merge lanes: skip vertical (diagonal already connects, no source above)
 - `collect_refs` per commit is O(commits × refs) → precompute ref map once
+- Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
+- Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted

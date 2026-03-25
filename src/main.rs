@@ -502,11 +502,18 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
     DiffData { lines, files }
 }
 
-/// Compute the set of commit indices on the same first-parent chain as `start_idx`.
-/// Walks upward (children via first-parent) and downward (first parent).
+/// Compute the set of commit indices to emphasize for `start_idx`.
+/// Walks upward through first-parent children to stay on the selected lane,
+/// and downward through all parents so merged ancestry stays highlighted.
 fn compute_branch_highlight(commits: &[CommitInfo], start_idx: usize) -> HashSet<usize> {
     let mut highlighted = HashSet::new();
     highlighted.insert(start_idx);
+
+    let index_by_oid: std::collections::HashMap<git2::Oid, usize> = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.oid, i))
+        .collect();
 
     // Build first-parent child map: parent_oid → child index
     let mut first_child_of: std::collections::HashMap<git2::Oid, usize> =
@@ -518,14 +525,15 @@ fn compute_branch_highlight(commits: &[CommitInfo], start_idx: usize) -> HashSet
         }
     }
 
-    // Walk downward: follow first parent
-    let mut idx = start_idx;
-    while let Some(first_parent) = commits[idx].parents.first() {
-        if let Some(parent_idx) = commits.iter().position(|c| c.oid == *first_parent) {
-            highlighted.insert(parent_idx);
-            idx = parent_idx;
-        } else {
-            break;
+    // Walk downward: follow all parents so merged-in history stays highlighted.
+    let mut stack = vec![start_idx];
+    while let Some(idx) = stack.pop() {
+        for parent_oid in &commits[idx].parents {
+            if let Some(&parent_idx) = index_by_oid.get(parent_oid)
+                && highlighted.insert(parent_idx)
+            {
+                stack.push(parent_idx);
+            }
         }
     }
 
@@ -760,6 +768,7 @@ struct GitkApp {
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
     diff_scroll_to: Option<usize>,
+    graph_scroll_to: Option<usize>, // commit index to scroll to in graph view
     repo_path: String,
     search_text: String,
     search_matches: Vec<usize>,
@@ -854,6 +863,7 @@ impl GitkApp {
             diff_lines,
             diff_files,
             diff_scroll_to: None,
+            graph_scroll_to: None,
             repo_path,
             search_text: String::new(),
             search_matches: Vec::new(),
@@ -865,6 +875,83 @@ impl GitkApp {
             branch_highlight: HashSet::new(),
         }
     }
+
+    fn refresh_search_matches(&mut self) {
+        if self.search_text.is_empty() {
+            self.search_matches.clear();
+            return;
+        }
+
+        let q = self.search_text.to_lowercase();
+        self.search_matches = self
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.summary.to_lowercase().contains(&q)
+                    || c.author.to_lowercase().contains(&q)
+                    || c.oid.to_string().starts_with(&q)
+                    || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if self.search_cursor >= self.search_matches.len() {
+            self.search_cursor = 0;
+        }
+    }
+
+    fn set_selected(&mut self, idx: usize) {
+        self.selected = Some(idx);
+        let highlight = compute_branch_highlight(&self.commits, idx);
+        self.branch_highlight = if highlight.len() < self.commits.len() {
+            highlight
+        } else {
+            HashSet::new()
+        };
+    }
+
+    fn load_selected_diff(&mut self, repo: &Repository) {
+        if let Some(sel) = self.selected
+            && sel < self.commits.len()
+        {
+            let data = get_diff_data(repo, self.commits[sel].oid);
+            self.diff_lines = data.lines;
+            self.diff_files = data.files;
+        } else {
+            self.diff_lines.clear();
+            self.diff_files.clear();
+        }
+    }
+
+    fn reload_commits(&mut self, repo: &Repository, preferred_oid: Option<git2::Oid>) {
+        let count = self.commits.len().max(200);
+        let previous_oid = self
+            .selected
+            .and_then(|sel| self.commits.get(sel))
+            .map(|commit| commit.oid);
+
+        self.commits = load_commits(repo, count);
+        self.graph_rows = layout_graph(&self.commits);
+        self.all_loaded = self.commits.len() < count;
+        self.refresh_search_matches();
+
+        let target_oid = preferred_oid.or(previous_oid);
+        self.selected = target_oid
+            .and_then(|oid| self.commits.iter().position(|c| c.oid == oid))
+            .or_else(|| (!self.commits.is_empty()).then_some(0));
+
+        if let Some(sel) = self.selected {
+            self.set_selected(sel);
+        } else {
+            self.branch_highlight.clear();
+        }
+    }
+
+    fn refresh_for_selection(&mut self, repo: &Repository, preferred_oid: git2::Oid) {
+        self.reload_commits(repo, Some(preferred_oid));
+        self.load_selected_diff(repo);
+        self.graph_scroll_to = self.selected;
+    }
 }
 
 impl eframe::App for GitkApp {
@@ -872,39 +959,30 @@ impl eframe::App for GitkApp {
         // Auto-reload when git refs change
         if self.needs_reload.swap(false, Ordering::Relaxed)
             && let Ok(repo) = Repository::discover(&self.repo_path) {
-                let count = self.commits.len().max(200);
-                self.commits = load_commits(&repo, count);
-                self.graph_rows = layout_graph(&self.commits);
-                self.all_loaded = self.commits.len() < count;
-                // Re-apply search
-                if !self.search_text.is_empty() {
-                    let q = self.search_text.to_lowercase();
-                    self.search_matches = self
-                        .commits
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| {
-                            c.summary.to_lowercase().contains(&q)
-                                || c.author.to_lowercase().contains(&q)
-                                || c.oid.to_string().starts_with(&q)
-                                || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                }
-                // Reload diff if a commit is selected
-                if let Some(sel) = self.selected
-                    && sel < self.commits.len() {
-                        let data = get_diff_data(&repo, self.commits[sel].oid);
-                        self.diff_lines = data.lines;
-                        self.diff_files = data.files;
-                    }
-            }
+            self.reload_commits(&repo, None);
+            self.load_selected_diff(&repo);
+        }
 
         let row_height = 20.0;
         let col_width = 12.0;
         let dot_radius = 3.5;
         let max_graph_cols = 20;
+
+        let search_id = egui::Id::new("search_field");
+
+        // Any printable keypress when search bar is not focused → focus it.
+        // The TextEdit will pick up the pending Text event once it has focus.
+        let search_has_focus = ctx.memory(|m| m.has_focus(search_id));
+        if !search_has_focus {
+            let has_text_event = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty()))
+            });
+            if has_text_event {
+                ctx.memory_mut(|m| m.request_focus(search_id));
+            }
+        }
 
         // ── Top panel: search bar ──
         egui::TopBottomPanel::top("search_panel")
@@ -915,32 +993,20 @@ impl eframe::App for GitkApp {
                     let avail = ui.available_width() - 120.0; // leave space for match count
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_text)
+                            .id(search_id)
                             .desired_width(avail.max(100.0))
                             .hint_text("Search SHA, author, message...")
                             .font(egui::FontId::monospace(13.0)),
                     );
                     if resp.changed() {
-                        let q = self.search_text.to_lowercase();
                         self.search_cursor = 0;
-                        if q.is_empty() {
-                            self.search_matches.clear();
-                        } else {
-                            self.search_matches = self
-                                .commits
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, c)| {
-                                    c.summary.to_lowercase().contains(&q)
-                                        || c.author.to_lowercase().contains(&q)
-                                        || c.oid.to_string().starts_with(&q)
-                                        || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
-                                })
-                                .map(|(i, _)| i)
-                                .collect();
-                        }
+                        self.refresh_search_matches();
                         // Jump to first match
                         if let Some(&idx) = self.search_matches.first() {
-                            self.selected = Some(idx);
+                            if let Ok(repo) = Repository::discover(&self.repo_path) {
+                                let oid = self.commits[idx].oid;
+                                self.refresh_for_selection(&repo, oid);
+                            }
                         }
                     }
                     // Enter cycles through matches
@@ -949,11 +1015,9 @@ impl eframe::App for GitkApp {
                             self.search_cursor =
                                 (self.search_cursor + 1) % self.search_matches.len();
                             let idx = self.search_matches[self.search_cursor];
-                            self.selected = Some(idx);
                             let repo = Repository::discover(&self.repo_path).unwrap();
-                            let data = get_diff_data(&repo, self.commits[idx].oid);
-                            self.diff_lines = data.lines;
-                            self.diff_files = data.files;
+                            let oid = self.commits[idx].oid;
+                            self.refresh_for_selection(&repo, oid);
                         }
                         resp.request_focus();
                     }
@@ -1159,6 +1223,7 @@ impl eframe::App for GitkApp {
                 + 8.0;
 
             let panel_height = ui.available_height();
+            let graph_scroll_to = self.graph_scroll_to.take();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -1191,10 +1256,10 @@ impl eframe::App for GitkApp {
                             let row_offset = ((pos.y - top_left.y) / row_height) as usize;
                             let clicked_idx = row_range.start + row_offset;
                             if clicked_idx < num_commits {
-                                self.selected = Some(clicked_idx);
                                 let commit = &self.commits[clicked_idx];
+                                let clicked_oid = commit.oid;
                                 // Copy SHA to both clipboards
-                                let sha = commit.oid.to_string();
+                                let sha = clicked_oid.to_string();
                                 ctx.copy_text(sha.clone());
                                 // Also set primary selection (middle-click paste)
                                 if let Ok(mut clip) = arboard::Clipboard::new() {
@@ -1204,19 +1269,8 @@ impl eframe::App for GitkApp {
                                         .text(&sha);
                                 }
                                 self.copied_toast = Some(std::time::Instant::now());
-                                let highlight =
-                                    compute_branch_highlight(&self.commits, clicked_idx);
-                                // Only show highlight if there are multiple branches
-                                // (if highlight covers all commits, there's only one branch)
-                                self.branch_highlight = if highlight.len() < self.commits.len() {
-                                    highlight
-                                } else {
-                                    HashSet::new()
-                                };
                                 let repo = Repository::discover(&self.repo_path).unwrap();
-                                let data = get_diff_data(&repo, commit.oid);
-                                self.diff_lines = data.lines;
-                                self.diff_files = data.files;
+                                self.refresh_for_selection(&repo, clicked_oid);
                             }
                         }
 
@@ -1259,15 +1313,23 @@ impl eframe::App for GitkApp {
                             painter.rect_filled(
                                 row_rect,
                                 0.0,
-                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 30),
+                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40),
                             );
                         } else if is_search_match {
-                            painter.rect_filled(
-                                row_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(249, 226, 175, 18),
+                            // Yellow accent bar on the left edge
+                            let bar = egui::Rect::from_min_size(
+                                row_rect.min,
+                                egui::vec2(3.0, row_rect.height()),
                             );
-                        } else if response.hover_pos().is_some_and(|p| row_rect.contains(p)) {
+                            painter.rect_filled(
+                                bar,
+                                0.0,
+                                egui::Color32::from_rgb(249, 226, 175),
+                            );
+                        }
+                        if self.selected != Some(idx)
+                            && response.hover_pos().is_some_and(|p| row_rect.contains(p))
+                        {
                             painter.rect_filled(
                                 row_rect,
                                 0.0,
@@ -1415,7 +1477,8 @@ impl eframe::App for GitkApp {
                         // Summary — truncate to available space before author
                         let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
                         let has_highlight = !self.branch_highlight.is_empty();
-                        let summary_color = if !has_highlight || is_branch_member {
+                        let search_active = !self.search_matches.is_empty();
+                        let summary_color = if search_active || !has_highlight || is_branch_member {
                             TEXT
                         } else {
                             SUBTEXT // dim non-branch commits
@@ -1449,6 +1512,20 @@ impl eframe::App for GitkApp {
                             date_galley,
                             SUBTEXT,
                         );
+                    }
+
+                    // Scroll to target commit if requested
+                    if let Some(target_idx) = graph_scroll_to {
+                        // Compute the target rect in the scroll content's coordinate space.
+                        // The content origin is at top_left.y - (first_row as f32 * row_height)
+                        // (since top_left is after the pre-spacer).
+                        let content_origin_y = top_left.y - first_row as f32 * row_height;
+                        let target_y = content_origin_y + target_idx as f32 * row_height;
+                        let target_rect = egui::Rect::from_min_size(
+                            egui::pos2(top_left.x, target_y),
+                            egui::vec2(1.0, row_height),
+                        );
+                        ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
                     }
 
                     // Post-spacer to maintain correct total scroll height
@@ -1688,6 +1765,32 @@ mod tests {
         // Commit 1 should have at least one diagonal (the merge)
         let has_diagonal = rows[0].lines.iter().any(|&(f, t, _)| f != t);
         assert!(has_diagonal, "Merge commit 1 should have a diagonal edge");
+    }
+
+    #[test]
+    fn test_merge_highlight_includes_merged_branch_ancestry() {
+        //   1 (merge: parents 2, 3)
+        //  / \
+        // 2   3
+        // |   |
+        // 5   4
+        //  \ /
+        //   6
+        let commits = vec![
+            commit(1, &[2, 3]),
+            commit(2, &[5]),
+            commit(3, &[4]),
+            commit(4, &[6]),
+            commit(5, &[6]),
+            commit(6, &[]),
+        ];
+
+        let highlight = compute_branch_highlight(&commits, 0);
+
+        assert!(highlight.contains(&0), "merge commit should be highlighted");
+        assert!(highlight.contains(&1), "first-parent side should be highlighted");
+        assert!(highlight.contains(&2), "merged branch tip should be highlighted");
+        assert!(highlight.contains(&3), "merged branch ancestry should be highlighted");
     }
 
     #[test]
