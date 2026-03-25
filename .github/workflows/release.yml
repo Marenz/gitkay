@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: gitkay
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: gitkay
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Package binary
+        run: |
+          cd target/release
+          tar czf ../../gitkay-${{ github.ref_name }}-${{ matrix.target }}.tar.gz gitkay
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitkay-${{ matrix.target }}
+          path: gitkay-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  rpm:
+    name: Build RPM
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gitkay-x86_64-unknown-linux-gnu
+
+      - name: Build RPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          # Create source tarball from the pre-built binary
+          mkdir -p gitkay-${{ github.ref_name }}
+          tar xzf gitkay-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz -C gitkay-${{ github.ref_name }}
+          cp LICENSE README.md gitkay-${{ github.ref_name }}/
+          tar czf rpmbuild/SOURCES/gitkay-${{ github.ref_name }}.tar.gz gitkay-${{ github.ref_name }}
+          # Build RPM from pre-compiled binary
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cat > rpmbuild/SPECS/gitkay.spec << 'SPEC'
+          Name:           gitkay
+          Version:        VERSION_PLACEHOLDER
+          Release:        1%{?dist}
+          Summary:        A fast, native Wayland git history viewer
+          License:        MIT
+          URL:            https://github.com/Marenz/gitkay
+          Source0:        gitkay-%{version}.tar.gz
+          AutoReq:        no
+
+          %description
+          gitkay is a native Wayland git history viewer — gitk, but okay.
+
+          %prep
+          %autosetup -n gitkay-v%{version}
+
+          %install
+          install -Dm755 gitkay %{buildroot}%{_bindir}/gitkay
+
+          %files
+          %license LICENSE
+          %doc README.md
+          %{_bindir}/gitkay
+          SPEC
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/" rpmbuild/SPECS/gitkay.spec
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/gitkay.spec
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitkay-rpm
+          path: rpmbuild/RPMS/**/*.rpm
+
+  deb:
+    name: Build deb
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gitkay-x86_64-unknown-linux-gnu
+
+      - name: Build deb
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          mkdir -p pkg/DEBIAN
+          mkdir -p pkg/usr/bin
+          tar xzf gitkay-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz -C pkg/usr/bin/
+          chmod 755 pkg/usr/bin/gitkay
+          cat > pkg/DEBIAN/control << EOF
+          Package: gitkay
+          Version: ${VERSION}
+          Section: vcs
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Marenz <marenz@supradigital.org>
+          Description: A fast, native Wayland git history viewer
+           gitkay is a native Wayland git history viewer — gitk, but okay.
+           Features commit graph, syntax-highlighted diffs, search, and
+           Catppuccin Mocha dark theme. Built with Rust + egui.
+          EOF
+          dpkg-deb --build pkg gitkay_${VERSION}_amd64.deb
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitkay-deb
+          path: "*.deb"
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build, rpm, deb]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        run: |
+          mkdir release
+          cp artifacts/gitkay-x86_64-unknown-linux-gnu/*.tar.gz release/
+          cp artifacts/gitkay-aarch64-unknown-linux-gnu/*.tar.gz release/
+          cp artifacts/gitkay-rpm/**/*.rpm release/ 2>/dev/null || true
+          cp artifacts/gitkay-deb/*.deb release/
+          ls -la release/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: false

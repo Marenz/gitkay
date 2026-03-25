@@ -1,5 +1,5 @@
 Name:           gitkay
-Version:        1.0.0
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        A fast, native Wayland git history viewer
 License:        MIT
@@ -35,6 +35,12 @@ install -Dm755 target/release/gitkay %{buildroot}%{_bindir}/gitkay
 %{_bindir}/gitkay
 
 %changelog
+* Tue Mar 25 2026 Marenz <marenz@supradigital.org> - 1.2.0-1
+- Any keypress focuses search bar instantly
+- Graph auto-scrolls to search matches
+- Search match highlight rework (yellow accent bar)
+- Branch dimming suppressed during active search
+
 * Sat Mar 22 2026 Marenz <marenz@supradigital.org> - 1.0.0-1
 - Initial release
 - Commit graph with colored lanes and merge visualization

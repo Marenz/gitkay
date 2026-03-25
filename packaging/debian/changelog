@@ -1,3 +1,12 @@
+gitkay (1.2.0-1) unstable; urgency=low
+
+  * Any keypress focuses search bar instantly
+  * Graph auto-scrolls to search matches
+  * Search match highlight rework (yellow accent bar)
+  * Branch dimming suppressed during active search
+
+ -- Marenz <marenz@supradigital.org>  Tue, 25 Mar 2026 12:00:00 +0100
+
 gitkay (1.0.0-1) unstable; urgency=low
 
   * Initial release.
