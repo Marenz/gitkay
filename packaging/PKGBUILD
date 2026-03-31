@@ -1,0 +1,21 @@
+pkgname=gitkay
+pkgver=1.1.0
+pkgrel=1
+pkgdesc="A fast, native Wayland git history viewer — gitk, but okay"
+arch=(x86_64)
+url="https://github.com/Marenz/gitkay"
+license=(MIT)
+depends=(gtk4 graphene openssl)
+makedepends=(cargo cmake)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Marenz/gitkay/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=(SKIP)
+
+options=(!lto)
+
+build() {
+    cargo build --release --manifest-path="$pkgname-$pkgver/Cargo.toml"
+}
+
+package() {
+    install -Dm755 "$pkgname-$pkgver/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+}
