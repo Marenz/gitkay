@@ -768,7 +768,7 @@ struct GitkApp {
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
     diff_scroll_to: Option<usize>,
-    graph_scroll_to: Option<usize>, // commit index to scroll to in graph view
+    graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     search_text: String,
     search_matches: Vec<usize>,
@@ -964,7 +964,9 @@ impl GitkApp {
     fn refresh_for_selection(&mut self, repo: &Repository, preferred_oid: git2::Oid) {
         self.reload_commits(repo, Some(preferred_oid));
         self.load_selected_diff(repo);
-        self.graph_scroll_to = self.selected;
+        // Center the target (used for clicks, search jumps): the destination may
+        // be far from the current view.
+        self.graph_scroll_to = self.selected.map(|i| (i, Some(egui::Align::Center)));
     }
 }
 
@@ -997,7 +999,7 @@ impl eframe::App for GitkApp {
 
         // Any printable keypress when search bar is not focused → focus it.
         // The TextEdit will pick up the pending Text event once it has focus.
-        let search_has_focus = ctx.memory(|m| m.has_focus(search_id));
+        let mut search_has_focus = ctx.memory(|m| m.has_focus(search_id));
         if !search_has_focus {
             let has_text_event = ctx.input(|i| {
                 i.events
@@ -1006,6 +1008,36 @@ impl eframe::App for GitkApp {
             });
             if has_text_event {
                 ctx.memory_mut(|m| m.request_focus(search_id));
+                // Focus takes effect this frame; route keys to search accordingly.
+                search_has_focus = true;
+            }
+        }
+
+        // Up/Down arrows move the selection through the commit list (when not
+        // typing in search). The graph scrolls minimally to keep it visible.
+        if !search_has_focus && !self.commits.is_empty() {
+            let delta: isize = ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    1
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if delta != 0 {
+                let last = self.commits.len() as isize - 1;
+                let new = match self.selected {
+                    Some(s) => (s as isize + delta).clamp(0, last) as usize,
+                    None => 0,
+                };
+                if Some(new) != self.selected {
+                    self.set_selected(new);
+                    if let Ok(repo) = Repository::discover(&self.repo_path) {
+                        self.load_selected_diff(&repo);
+                    }
+                    self.graph_scroll_to = Some((new, None));
+                }
             }
         }
 
@@ -1559,7 +1591,7 @@ impl eframe::App for GitkApp {
                     }
 
                     // Scroll to target commit if requested
-                    if let Some(target_idx) = graph_scroll_to {
+                    if let Some((target_idx, align)) = graph_scroll_to {
                         // Compute the target rect in the scroll content's coordinate space.
                         // The content origin is at top_left.y - (first_row as f32 * row_height)
                         // (since top_left is after the pre-spacer).
@@ -1569,7 +1601,7 @@ impl eframe::App for GitkApp {
                             egui::pos2(top_left.x, target_y),
                             egui::vec2(1.0, row_height),
                         );
-                        ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+                        ui.scroll_to_rect(target_rect, align);
                     }
 
                     // Post-spacer to maintain correct total scroll height
