@@ -779,6 +779,7 @@ struct GitkApp {
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
     diff_panel_height: f32, // persisted diff-panel splitter height (see App::save)
+    file_list_width: f32,   // persisted file-list sidebar width (see App::save)
 }
 
 impl GitkApp {
@@ -857,11 +858,15 @@ impl GitkApp {
             watcher
         };
 
-        // Restore the persisted diff-panel splitter height (written in App::save).
+        // Restore the persisted layout sizes (written in App::save).
         let diff_panel_height: f32 = cc
             .storage
             .and_then(|s| eframe::get_value(s, "diff_panel_height"))
             .unwrap_or(300.0);
+        let file_list_width: f32 = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "file_list_width"))
+            .unwrap_or(200.0);
 
         Self {
             commits,
@@ -881,6 +886,7 @@ impl GitkApp {
             _watcher: watcher,
             branch_highlight: HashSet::new(),
             diff_panel_height,
+            file_list_width,
         }
     }
 
@@ -971,6 +977,7 @@ impl eframe::App for GitkApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "diff_panel_height", &self.diff_panel_height);
+        eframe::set_value(storage, "file_list_width", &self.file_list_width);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1077,72 +1084,25 @@ impl eframe::App for GitkApp {
                 ui.separator();
                 ui.add_space(2.0);
 
-                ui.horizontal_top(|ui| {
-                    // Sidebar width driven by file names + stats
-                    let sidebar_width = if self.diff_files.is_empty() {
-                        0.0
-                    } else {
-                        let max_entry_len = self
-                            .diff_files
-                            .iter()
-                            .map(|f| {
-                                let name_len = f.path.rsplit('/').next().unwrap_or(&f.path).len();
-                                let stat_len = format!("+{} -{}", f.additions, f.deletions).len();
-                                name_len + stat_len + 2
-                            })
-                            .max()
-                            .unwrap_or(10);
-                        ((max_entry_len as f32 * 7.5) + 30.0).clamp(140.0, 280.0)
-                    };
-
-                    // Left: diff content (scrollable)
-                    let diff_width = ui.available_width() - sidebar_width - 10.0;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(diff_width.max(200.0), ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
-                            let scroll = egui::ScrollArea::both()
-                                .id_salt("diff_scroll")
-                                .animated(false);
-                            let scroll_target = self.diff_scroll_to.take();
-
-                            scroll.show(ui, |ui| {
-                                for (i, line) in self.diff_lines.iter().enumerate() {
-                                    let color = match line.kind {
-                                        LineKind::Add => GREEN,
-                                        LineKind::Del => RED,
-                                        LineKind::Hunk => BLUE,
-                                        LineKind::Meta => MAUVE,
-                                        LineKind::FileMeta => MAUVE,
-                                        LineKind::FileName => YELLOW,
-                                        LineKind::Stat => SUBTEXT,
-                                        LineKind::Context => TEXT,
-                                    };
-                                    let resp = ui.colored_label(color, &line.text);
-                                    if scroll_target == Some(i) {
-                                        ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
-                                    }
-                                }
-                            });
-                        },
-                    );
-
-                    ui.separator();
-
-                    // Right: file list with hover effects
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(sidebar_width, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            if !self.diff_files.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(format!("{} files", self.diff_files.len()))
-                                        .color(SUBTEXT)
-                                        .size(11.0),
-                                );
-                                ui.add_space(4.0);
-                            }
+                // Right: resizable file-list sidebar — draggable splitter, width
+                // persisted across runs (see App::save). Shown only when the
+                // selected commit touches files.
+                let mut divider: Option<egui::Rect> = None;
+                if !self.diff_files.is_empty() {
+                    let saved_w = self.file_list_width;
+                    let file_panel = egui::SidePanel::right("file_list_panel")
+                        .resizable(true)
+                        .default_width(saved_w)
+                        .min_width(140.0)
+                        .max_width(400.0)
+                        .frame(egui::Frame::NONE)
+                        .show_inside(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} files", self.diff_files.len()))
+                                    .color(SUBTEXT)
+                                    .size(11.0),
+                            );
+                            ui.add_space(4.0);
                             egui::ScrollArea::vertical()
                                 .id_salt("file_list")
                                 .show(ui, |ui| {
@@ -1223,9 +1183,65 @@ impl eframe::App for GitkApp {
                                         }
                                     }
                                 });
-                        },
-                    );
-                });
+                        });
+                    // Only persist the width on an actual resize-drag, not when
+                    // egui clamps the panel to a narrow window (which would
+                    // otherwise ratchet the saved width down across launches).
+                    if ctx
+                        .read_response(egui::Id::new("file_list_panel").with("__resize"))
+                        .is_some_and(|r| r.dragged())
+                    {
+                        self.file_list_width = file_panel.response.rect.width();
+                    }
+                    divider = Some(file_panel.response.rect);
+                }
+
+                // Left: diff content fills the remaining width. Right padding keeps
+                // the diff scrollbar from crowding the file-list resize bar — only
+                // when that sidebar is actually shown.
+                let diff_right_pad = if self.diff_files.is_empty() { 0 } else { 10 };
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                        left: 0,
+                        right: diff_right_pad,
+                        top: 0,
+                        bottom: 0,
+                    }))
+                    .show_inside(ui, |ui| {
+                        ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
+                        let scroll = egui::ScrollArea::both()
+                            .id_salt("diff_scroll")
+                            .auto_shrink([false, false])
+                            .animated(false);
+                        let scroll_target = self.diff_scroll_to.take();
+                        scroll.show(ui, |ui| {
+                            for (i, line) in self.diff_lines.iter().enumerate() {
+                                let color = match line.kind {
+                                    LineKind::Add => GREEN,
+                                    LineKind::Del => RED,
+                                    LineKind::Hunk => BLUE,
+                                    LineKind::Meta => MAUVE,
+                                    LineKind::FileMeta => MAUVE,
+                                    LineKind::FileName => YELLOW,
+                                    LineKind::Stat => SUBTEXT,
+                                    LineKind::Context => TEXT,
+                                };
+                                let resp = ui.colored_label(color, &line.text);
+                                if scroll_target == Some(i) {
+                                    ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
+                                }
+                            }
+                        });
+                    });
+
+                // The side panel already draws a separator at the divider that
+                // brightens on hover. Add a second static line a few px into the
+                // gap so the divider reads as a double line — matching the
+                // commit-list / diff separator above.
+                if let Some(r) = divider {
+                    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                    ui.painter().vline(r.left() - 5.0, r.y_range(), stroke);
+                }
             });
         // Remember the splitter height for next launch (persisted in App::save),
         // but only on an actual resize-drag — capturing every frame would persist
