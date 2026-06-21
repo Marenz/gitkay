@@ -211,13 +211,27 @@ struct DiffData {
     files: Vec<FileEntry>,
 }
 
-fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
+/// Diff rendering options controlled from the toolbar.
+#[derive(Clone, Copy)]
+struct DiffSettings {
+    context: u32,
+    ignore_ws: bool,
+}
+
+fn diff_opts(settings: DiffSettings) -> DiffOptions {
+    let mut opts = DiffOptions::new();
+    opts.context_lines(settings.context)
+        .ignore_whitespace(settings.ignore_ws);
+    opts
+}
+
+fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> DiffData {
     // Handle virtual entries
     if oid == oid_uncommitted() {
-        return get_working_tree_diff(repo);
+        return get_working_tree_diff(repo, settings);
     }
     if oid == oid_staged() {
-        return get_staged_diff(repo);
+        return get_staged_diff(repo, settings);
     }
 
     let commit = match repo.find_commit(oid) {
@@ -240,7 +254,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
-    let mut opts = DiffOptions::new();
+    let mut opts = diff_opts(settings);
     let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
@@ -369,8 +383,9 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
-fn get_working_tree_diff(repo: &Repository) -> DiffData {
-    let diff = match repo.diff_index_to_workdir(None, None) {
+fn get_working_tree_diff(repo: &Repository, settings: DiffSettings) -> DiffData {
+    let mut opts = diff_opts(settings);
+    let diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
             return DiffData {
@@ -383,13 +398,14 @@ fn get_working_tree_diff(repo: &Repository) -> DiffData {
 }
 
 /// Generate diff for staged changes (index vs HEAD).
-fn get_staged_diff(repo: &Repository) -> DiffData {
+fn get_staged_diff(repo: &Repository, settings: DiffSettings) -> DiffData {
     let head_tree = repo
         .head()
         .ok()
         .and_then(|h| h.peel_to_commit().ok())
         .and_then(|c| c.tree().ok());
-    let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+    let mut opts = diff_opts(settings);
+    let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
             return DiffData {
@@ -780,6 +796,9 @@ struct GitkApp {
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
     diff_panel_height: f32, // persisted diff-panel splitter height (see App::save)
     file_list_width: f32,   // persisted file-list sidebar width (see App::save)
+    diff_context: u32,      // diff context lines (persisted)
+    diff_ignore_ws: bool,   // ignore all whitespace in diffs (persisted)
+    diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
 }
 
 impl GitkApp {
@@ -797,9 +816,25 @@ impl GitkApp {
         let commits = load_commits(&repo, 200);
         let graph_rows = layout_graph(&commits);
 
+        // Restore persisted diff options before the first diff is generated, so
+        // the startup diff honours them.
+        let diff_context: u32 = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "diff_context"))
+            .unwrap_or(3)
+            .min(99); // clamp a stale/hand-edited value to the UI range
+        let diff_ignore_ws: bool = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "diff_ignore_ws"))
+            .unwrap_or(false);
+        let diff_settings = DiffSettings {
+            context: diff_context,
+            ignore_ws: diff_ignore_ws,
+        };
+
         // Auto-select first commit and load its diff
         let (diff_lines, diff_files) = if let Some(first) = commits.first() {
-            let data = get_diff_data(&repo, first.oid);
+            let data = get_diff_data(&repo, first.oid, diff_settings);
             (data.lines, data.files)
         } else {
             (Vec::new(), Vec::new())
@@ -887,6 +922,9 @@ impl GitkApp {
             branch_highlight: HashSet::new(),
             diff_panel_height,
             file_list_width,
+            diff_context,
+            diff_ignore_ws,
+            diff_toolbar_rect: None,
         }
     }
 
@@ -924,11 +962,18 @@ impl GitkApp {
         };
     }
 
+    fn diff_settings(&self) -> DiffSettings {
+        DiffSettings {
+            context: self.diff_context,
+            ignore_ws: self.diff_ignore_ws,
+        }
+    }
+
     fn load_selected_diff(&mut self, repo: &Repository) {
         if let Some(sel) = self.selected
             && sel < self.commits.len()
         {
-            let data = get_diff_data(repo, self.commits[sel].oid);
+            let data = get_diff_data(repo, self.commits[sel].oid, self.diff_settings());
             self.diff_lines = data.lines;
             self.diff_files = data.files;
         } else {
@@ -980,6 +1025,8 @@ impl eframe::App for GitkApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "diff_panel_height", &self.diff_panel_height);
         eframe::set_value(storage, "file_list_width", &self.file_list_width);
+        eframe::set_value(storage, "diff_context", &self.diff_context);
+        eframe::set_value(storage, "diff_ignore_ws", &self.diff_ignore_ws);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1129,6 +1176,68 @@ impl eframe::App for GitkApp {
                 ui.add_space(3.0);
                 ui.separator();
                 ui.add_space(2.0);
+
+                // Diff options toolbar — hidden until the pointer is near the top
+                // of the diff panel, then shown as a floating overlay so it never
+                // takes vertical space from the diff.
+                let panel_rect = ui.max_rect();
+                // Anchor the overlay just below the panel's resize-grab strip so it
+                // doesn't sit on top of (and steal drags from) the splitter handle.
+                let toolbar_pos = egui::pos2(panel_rect.min.x, panel_rect.min.y + 8.0);
+                // Hover zone starts below the resize edge and is tall enough to
+                // cover the whole toolbar (avoids flicker at the toolbar's bottom edge).
+                let hover_zone = egui::Rect::from_min_max(
+                    egui::pos2(panel_rect.min.x, panel_rect.min.y + 6.0),
+                    egui::pos2(panel_rect.max.x, panel_rect.min.y + 46.0),
+                );
+                // Reveal when the pointer is over the top strip OR still over the
+                // toolbar itself. Use the raw pointer position rather than
+                // rect_contains_pointer, which is occlusion-aware and flickers
+                // once the foreground overlay slides under the cursor.
+                let show_toolbar = ctx.pointer_hover_pos().is_some_and(|p| {
+                    hover_zone.contains(p)
+                        || self
+                            .diff_toolbar_rect
+                            .is_some_and(|r| r.expand(2.0).contains(p))
+                });
+                let mut diff_opts_changed = false;
+                if show_toolbar {
+                    let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(toolbar_pos)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Context:");
+                                    if ui.small_button("-").clicked() {
+                                        self.diff_context = self.diff_context.saturating_sub(1);
+                                        diff_opts_changed = true;
+                                    }
+                                    ui.monospace(self.diff_context.to_string());
+                                    if ui.small_button("+").clicked() {
+                                        self.diff_context =
+                                            self.diff_context.saturating_add(1).min(99);
+                                        diff_opts_changed = true;
+                                    }
+                                    ui.add_space(12.0);
+                                    if ui
+                                        .checkbox(&mut self.diff_ignore_ws, "Ignore whitespace")
+                                        .changed()
+                                    {
+                                        diff_opts_changed = true;
+                                    }
+                                });
+                            });
+                        });
+                    self.diff_toolbar_rect = Some(area.response.rect);
+                } else {
+                    self.diff_toolbar_rect = None;
+                }
+                if diff_opts_changed
+                    && let Ok(repo) = Repository::discover(&self.repo_path)
+                {
+                    self.load_selected_diff(&repo);
+                }
 
                 // Right: resizable file-list sidebar — draggable splitter, width
                 // persisted across runs (see App::save). Shown only when the
