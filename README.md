@@ -68,6 +68,18 @@
 
 ## Install
 
+### Gentoo
+
+Packaged in the [GURU](https://wiki.gentoo.org/wiki/Project:GURU) overlay.
+
+```sh
+# Enable the GURU repository (needs app-eselect/eselect-repository)
+sudo eselect repository enable guru
+sudo emaint sync -r guru
+
+sudo emerge --ask dev-vcs/gitkay
+```
+
 ### From source (recommended)
 
 ```sh
