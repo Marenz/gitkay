@@ -778,6 +778,7 @@ struct GitkApp {
     needs_reload: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
+    diff_panel_height: f32, // persisted diff-panel splitter height (see App::save)
 }
 
 impl GitkApp {
@@ -856,6 +857,12 @@ impl GitkApp {
             watcher
         };
 
+        // Restore the persisted diff-panel splitter height (written in App::save).
+        let diff_panel_height: f32 = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "diff_panel_height"))
+            .unwrap_or(300.0);
+
         Self {
             commits,
             graph_rows,
@@ -873,6 +880,7 @@ impl GitkApp {
             needs_reload,
             _watcher: watcher,
             branch_highlight: HashSet::new(),
+            diff_panel_height,
         }
     }
 
@@ -955,6 +963,16 @@ impl GitkApp {
 }
 
 impl eframe::App for GitkApp {
+    // Persist only the diff-panel splitter height (below), not the whole egui
+    // memory blob — persisting the blob would also restore scroll positions.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "diff_panel_height", &self.diff_panel_height);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Auto-reload when git refs change
         if self.needs_reload.swap(false, Ordering::Relaxed)
@@ -1044,10 +1062,11 @@ impl eframe::App for GitkApp {
             });
 
         // ── Bottom panel: diff view + file list ──
-        egui::TopBottomPanel::bottom("diff_panel")
+        let saved_panel_h = self.diff_panel_height;
+        let diff_panel = egui::TopBottomPanel::bottom("diff_panel")
             .resizable(true)
             .min_height(100.0)
-            .default_height(300.0)
+            .default_height(saved_panel_h)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(4, 0)),
@@ -1208,6 +1227,15 @@ impl eframe::App for GitkApp {
                     );
                 });
             });
+        // Remember the splitter height for next launch (persisted in App::save),
+        // but only on an actual resize-drag — capturing every frame would persist
+        // a window-clamped height and ratchet the saved value down.
+        if ctx
+            .read_response(egui::Id::new("diff_panel").with("__resize"))
+            .is_some_and(|r| r.dragged())
+        {
+            self.diff_panel_height = diff_panel.response.rect.height();
+        }
 
         // ── Central panel: commit graph + list ──
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1571,6 +1599,11 @@ fn main() -> eframe::Result {
             .with_inner_size([1200.0, 800.0])
             .with_app_id("gitkay")
             .with_title(&title),
+        // Persist the egui layout (the diff splitter) but NOT native window
+        // geometry. eframe's window size round-trip is unstable on Wayland
+        // (fractional scaling + client-side decorations) and makes the window
+        // grow on every restart; the window opens at the size set above instead.
+        persist_window: false,
         ..Default::default()
     };
 
