@@ -1013,22 +1013,36 @@ impl eframe::App for GitkApp {
             }
         }
 
-        // Up/Down arrows move the selection through the commit list (when not
-        // typing in search). The graph scrolls minimally to keep it visible.
-        if !search_has_focus && !self.commits.is_empty() {
-            let delta: isize = ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                    1
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                    -1
-                } else {
-                    0
+        // Up/Down: cycle through search matches when the search bar is focused,
+        // otherwise move the commit-list selection (view follows minimally).
+        let arrow_delta: isize = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                1
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if arrow_delta != 0 {
+            if search_has_focus {
+                if !self.search_matches.is_empty() {
+                    let len = self.search_matches.len() as isize;
+                    self.search_cursor =
+                        (self.search_cursor as isize + arrow_delta).rem_euclid(len) as usize;
+                    // Cycle to the match without reloading the whole history: the
+                    // match index is already valid for the current commit list.
+                    let idx = self.search_matches[self.search_cursor];
+                    self.set_selected(idx);
+                    if let Ok(repo) = Repository::discover(&self.repo_path) {
+                        self.load_selected_diff(&repo);
+                    }
+                    self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
                 }
-            });
-            if delta != 0 {
+            } else if !self.commits.is_empty() {
                 let last = self.commits.len() as isize - 1;
                 let new = match self.selected {
-                    Some(s) => (s as isize + delta).clamp(0, last) as usize,
+                    Some(s) => (s as isize + arrow_delta).clamp(0, last) as usize,
                     None => 0,
                 };
                 if Some(new) != self.selected {
