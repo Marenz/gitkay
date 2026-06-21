@@ -94,6 +94,54 @@ pub fn read_config(path: &Path) -> Result<Config, String> {
     toml::from_str(&text).map_err(|e| format!("invalid config {path:?}: {e}"))
 }
 
+fn egui_family(f: Family) -> egui::FontFamily {
+    match f {
+        Family::Monospace => egui::FontFamily::Monospace,
+        Family::Proportional => egui::FontFamily::Proportional,
+    }
+}
+
+/// Resolved, clamped font settings ready to hand to egui per role.
+pub struct Fonts {
+    sizes: SizesSection,
+    families: FamiliesSection,
+}
+
+impl Fonts {
+    pub fn from_config(cfg: &Config) -> Fonts {
+        let clamp = |v: f32| v.clamp(MIN_SIZE, MAX_SIZE);
+        Fonts {
+            sizes: SizesSection {
+                diff: clamp(cfg.sizes.diff),
+                commit_summary: clamp(cfg.sizes.commit_summary),
+                commit_meta: clamp(cfg.sizes.commit_meta),
+                refs: clamp(cfg.sizes.refs),
+                file_list: clamp(cfg.sizes.file_list),
+                ui: clamp(cfg.sizes.ui),
+            },
+            families: cfg.families.clone(),
+        }
+    }
+
+    pub fn font_id(&self, role: Role) -> egui::FontId {
+        let (size, family) = match role {
+            Role::Diff => (self.sizes.diff, self.families.diff),
+            Role::CommitSummary => (self.sizes.commit_summary, self.families.commit_summary),
+            Role::CommitMeta => (self.sizes.commit_meta, self.families.commit_meta),
+            Role::Refs => (self.sizes.refs, self.families.refs),
+            Role::FileList => (self.sizes.file_list, self.families.file_list),
+            Role::Ui => (self.sizes.ui, self.families.ui),
+        };
+        egui::FontId::new(size, egui_family(family))
+    }
+
+    /// File-list +/- stats: same family as the file list, two px smaller.
+    pub fn file_stats_font_id(&self) -> egui::FontId {
+        let size = (self.sizes.file_list - 2.0).max(MIN_SIZE);
+        egui::FontId::new(size, egui_family(self.families.file_list))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +182,42 @@ mod tests {
         let p = std::env::temp_dir().join("gitkay_nonexistent_config_check.toml");
         let _ = std::fs::remove_file(&p); // ensure it does not exist
         assert_eq!(read_config(&p).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn default_font_ids_match_current_sizes() {
+        let fonts = Fonts::from_config(&Config::default());
+        assert_eq!(fonts.font_id(Role::Diff).size, 13.0);
+        assert_eq!(fonts.font_id(Role::CommitMeta).size, 12.0);
+        assert_eq!(fonts.font_id(Role::Refs).size, 11.0);
+        assert_eq!(fonts.font_id(Role::Ui).family, egui::FontFamily::Monospace);
+    }
+
+    #[test]
+    fn proportional_role_uses_proportional_family() {
+        let mut cfg = Config::default();
+        cfg.families.commit_summary = Family::Proportional;
+        let fonts = Fonts::from_config(&cfg);
+        assert_eq!(
+            fonts.font_id(Role::CommitSummary).family,
+            egui::FontFamily::Proportional
+        );
+    }
+
+    #[test]
+    fn sizes_are_clamped() {
+        let mut cfg = Config::default();
+        cfg.sizes.diff = 1000.0;
+        cfg.sizes.refs = 0.5;
+        let fonts = Fonts::from_config(&cfg);
+        assert_eq!(fonts.font_id(Role::Diff).size, 64.0);
+        assert_eq!(fonts.font_id(Role::Refs).size, 4.0);
+    }
+
+    #[test]
+    fn file_stats_is_two_smaller_than_file_list() {
+        let fonts = Fonts::from_config(&Config::default());
+        assert_eq!(fonts.font_id(Role::FileList).size, 12.0);
+        assert_eq!(fonts.file_stats_font_id().size, 10.0);
     }
 }
