@@ -4,6 +4,7 @@
 
 use eframe::egui;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const MIN_SIZE: f32 = 4.0;
@@ -202,6 +203,58 @@ pub fn write_default_template(path: &Path) {
     let _ = std::fs::write(path, default_template());
 }
 
+/// Resolve a configured family name to a font file, using the cache first and
+/// the injected `scan` (fontdb) only on a miss or a stale entry.
+pub fn resolve_font_path(
+    name: &str,
+    cache: &mut BTreeMap<String, String>,
+    exists: &impl Fn(&Path) -> bool,
+    scan: &mut impl FnMut(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(cached) = cache.get(name).cloned() {
+        let pb = PathBuf::from(&cached);
+        if exists(&pb) {
+            return Some(pb);
+        }
+        cache.remove(name); // stale entry — evict so a failed rescan doesn't leave it behind
+    }
+    let found = scan(name)?;
+    cache.insert(name.to_owned(), found.to_string_lossy().into_owned());
+    Some(found)
+}
+
+/// Pick a font source for one family: an explicit path wins outright; otherwise
+/// resolve the name (cache + scan). Returns `None` when neither is configured.
+pub fn family_source(
+    name: &Option<String>,
+    path: &Option<String>,
+    cache: &mut BTreeMap<String, String>,
+    exists: &impl Fn(&Path) -> bool,
+    scan: &mut impl FnMut(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = path {
+        return Some(PathBuf::from(p));
+    }
+    let name = name.as_ref()?;
+    resolve_font_path(name, cache, exists, scan)
+}
+
+pub fn load_cache(path: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_cache(path: &Path, cache: &BTreeMap<String, String>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(s) = toml::to_string(cache) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +348,75 @@ mod tests {
         assert!(t.contains("# commit_meta = 12"));
         assert!(t.contains("# refs = 11"));
         assert!(t.contains("# ui = 13"));
+    }
+
+    #[test]
+    fn cache_hit_skips_scan() {
+        let mut cache = BTreeMap::new();
+        cache.insert("Fira".to_owned(), "/fonts/fira.ttf".to_owned());
+        let exists = |_: &Path| true;
+        let mut scanned = false;
+        let mut scan = |_: &str| {
+            scanned = true;
+            None
+        };
+        let got = resolve_font_path("Fira", &mut cache, &exists, &mut scan);
+        assert_eq!(got, Some(PathBuf::from("/fonts/fira.ttf")));
+        assert!(!scanned, "scan must not run on a valid cache hit");
+    }
+
+    #[test]
+    fn stale_cache_entry_triggers_rescan() {
+        let mut cache = BTreeMap::new();
+        cache.insert("Fira".to_owned(), "/gone.ttf".to_owned());
+        let exists = |_: &Path| false; // cached path no longer exists
+        let mut scan = |_: &str| Some(PathBuf::from("/fonts/fira-new.ttf"));
+        let got = resolve_font_path("Fira", &mut cache, &exists, &mut scan);
+        assert_eq!(got, Some(PathBuf::from("/fonts/fira-new.ttf")));
+        assert_eq!(cache.get("Fira").map(String::as_str), Some("/fonts/fira-new.ttf"));
+    }
+
+    #[test]
+    fn miss_scans_and_caches() {
+        let mut cache = BTreeMap::new();
+        let exists = |_: &Path| true;
+        let mut scan = |_: &str| Some(PathBuf::from("/fonts/found.ttf"));
+        let got = resolve_font_path("Inter", &mut cache, &exists, &mut scan);
+        assert_eq!(got, Some(PathBuf::from("/fonts/found.ttf")));
+        assert_eq!(cache.get("Inter").map(String::as_str), Some("/fonts/found.ttf"));
+    }
+
+    #[test]
+    fn miss_with_no_match_returns_none() {
+        let mut cache = BTreeMap::new();
+        let exists = |_: &Path| true;
+        let mut scan = |_: &str| None;
+        assert_eq!(resolve_font_path("Nope", &mut cache, &exists, &mut scan), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn family_source_prefers_explicit_path() {
+        let mut cache = BTreeMap::new();
+        let exists = |_: &Path| true;
+        let mut scan = |_: &str| -> Option<PathBuf> { panic!("must not scan when path is set") };
+        let got = family_source(
+            &Some("Whatever".to_owned()),
+            &Some("/explicit.ttf".to_owned()),
+            &mut cache,
+            &exists,
+            &mut scan,
+        );
+        assert_eq!(got, Some(PathBuf::from("/explicit.ttf")));
+    }
+
+    #[test]
+    fn stale_entry_evicted_when_rescan_fails() {
+        let mut cache = BTreeMap::new();
+        cache.insert("Fira".to_owned(), "/gone.ttf".to_owned());
+        let exists = |_: &Path| false;
+        let mut scan = |_: &str| None;
+        assert_eq!(resolve_font_path("Fira", &mut cache, &exists, &mut scan), None);
+        assert!(!cache.contains_key("Fira"), "stale entry should be evicted");
     }
 }
