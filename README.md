@@ -33,7 +33,7 @@
 - Native Wayland — no XWayland, no Tk, no X11 selection bugs
 - Starts in **under 200ms** — lazy loading, precomputed ref maps
 - Catppuccin Mocha dark theme that matches your rice
-- Written in Rust, single binary, zero config
+- Written in Rust, single binary — works with zero config, optional config file for fonts
 
 ## Features
 
@@ -144,7 +144,7 @@ gitkay /path/to/repo
 
 ## Architecture
 
-Single-file Rust app (~2100 lines) with 16 unit tests:
+Rust app (~2100 lines in `src/main.rs`, plus `src/config.rs` for font config) with 44 unit tests:
 
 - **egui** + **eframe** — native Wayland window with wgpu rendering
 - **git2** (libgit2) — repository access, revwalk, diff
@@ -152,6 +152,15 @@ Single-file Rust app (~2100 lines) with 16 unit tests:
 - **arboard** — clipboard (both clipboard and primary selection)
 
 The graph layout uses a pipe-based algorithm where each lane tracks an OID and a persistent color index. First parent always continues in the same column. Colors survive column shifts. Convergence is detected when multiple lanes point to the same commit.
+
+## Configuration
+
+gitkay runs with no configuration. To customise fonts, edit
+`~/.config/gitkay/config.toml` — a fully-commented template with every default is
+written on first run. You can set a monospace and a proportional font family (by
+installed name, resolved from installed system fonts, or by explicit file path) and a size
+plus family for each text role: `diff`, `commit_summary`, `commit_meta`, `refs`,
+`file_list`, and `ui`. Changes apply live on save; no restart needed.
 
 ## License
 

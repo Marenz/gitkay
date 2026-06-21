@@ -6,15 +6,19 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 16 graph/highlight tests
+cargo test                # 44 tests (16 graph/highlight + 28 config)
 cp target/release/gitkay ~/.local/bin/
 ```
 
 System dependencies (openSUSE): `gtk4-devel libgraphene-devel openssl-devel`
 
+Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
+`serde` + `toml` (config). No new system packages required.
+
 ## Architecture
 
-Single-file app at `src/main.rs` (~2100 lines). Three sections:
+App at `src/main.rs` (~2100 lines) plus `src/config.rs` (font/size config:
+TOML parsing, fontdb resolution + cache, role→FontId map). `main.rs` has three sections:
 
 ### Data Layer
 - `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
