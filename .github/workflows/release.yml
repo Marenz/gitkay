@@ -33,7 +33,9 @@ jobs:
           sudo apt-get install -y libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -51,9 +53,11 @@ jobs:
         run: cargo test
 
       - name: Package binary
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           cd target/release
-          tar czf ../../gitkay-${{ github.ref_name }}-${{ matrix.target }}.tar.gz gitkay
+          tar czf "../../gitkay-${REF_NAME}-${{ matrix.target }}.tar.gz" gitkay
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -74,14 +78,16 @@ jobs:
           name: gitkay-x86_64-unknown-linux-gnu
 
       - name: Build RPM
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm
-          VERSION="${{ github.ref_name }}"
+          VERSION="${REF_NAME}"
           VERSION="${VERSION#v}"
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           mkdir -p gitkay-${VERSION}
-          tar xzf gitkay-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz -C gitkay-${VERSION}
+          tar xzf "gitkay-${REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C gitkay-${VERSION}
           cp LICENSE README.md gitkay-${VERSION}/
           tar czf rpmbuild/SOURCES/gitkay-${VERSION}.tar.gz gitkay-${VERSION}
           cat > rpmbuild/SPECS/gitkay.spec << 'SPEC'
@@ -130,12 +136,14 @@ jobs:
           name: gitkay-x86_64-unknown-linux-gnu
 
       - name: Build deb
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${{ github.ref_name }}"
+          VERSION="${REF_NAME}"
           VERSION="${VERSION#v}"
           mkdir -p pkg/DEBIAN
           mkdir -p pkg/usr/bin
-          tar xzf gitkay-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz -C pkg/usr/bin/
+          tar xzf "gitkay-${REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C pkg/usr/bin/
           chmod 755 pkg/usr/bin/gitkay
           cat > pkg/DEBIAN/control << EOF
           Package: gitkay
