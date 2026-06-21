@@ -33,21 +33,21 @@ pub enum Family {
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct FontsSection {
-    pub monospace: Option<String>,
-    pub proportional: Option<String>,
-    pub monospace_path: Option<String>,
-    pub proportional_path: Option<String>,
+    pub(crate) monospace: Option<String>,
+    pub(crate) proportional: Option<String>,
+    pub(crate) monospace_path: Option<String>,
+    pub(crate) proportional_path: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct SizesSection {
-    pub diff: f32,
-    pub commit_summary: f32,
-    pub commit_meta: f32,
-    pub refs: f32,
-    pub file_list: f32,
-    pub ui: f32,
+    pub(crate) diff: f32,
+    pub(crate) commit_summary: f32,
+    pub(crate) commit_meta: f32,
+    pub(crate) refs: f32,
+    pub(crate) file_list: f32,
+    pub(crate) ui: f32,
 }
 
 impl Default for SizesSection {
@@ -66,20 +66,20 @@ impl Default for SizesSection {
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct FamiliesSection {
-    pub diff: Family,
-    pub commit_summary: Family,
-    pub commit_meta: Family,
-    pub refs: Family,
-    pub file_list: Family,
-    pub ui: Family,
+    pub(crate) diff: Family,
+    pub(crate) commit_summary: Family,
+    pub(crate) commit_meta: Family,
+    pub(crate) refs: Family,
+    pub(crate) file_list: Family,
+    pub(crate) ui: Family,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct Config {
-    pub fonts: FontsSection,
-    pub sizes: SizesSection,
-    pub families: FamiliesSection,
+    pub(crate) fonts: FontsSection,
+    pub(crate) sizes: SizesSection,
+    pub(crate) families: FamiliesSection,
 }
 
 /// Read + parse the config. A missing file is not an error (returns defaults);
@@ -103,21 +103,22 @@ fn egui_family(f: Family) -> egui::FontFamily {
 
 /// Resolved, clamped font settings ready to hand to egui per role.
 pub struct Fonts {
-    sizes: SizesSection,
+    sizes: SizesSection, // clamped to [MIN_SIZE, MAX_SIZE] at construction
     families: FamiliesSection,
 }
 
 impl Fonts {
     pub fn from_config(cfg: &Config) -> Fonts {
-        let clamp = |v: f32| v.clamp(MIN_SIZE, MAX_SIZE);
+        let d = SizesSection::default();
+        let clamp = |v: f32, default: f32| (if v.is_nan() { default } else { v }).clamp(MIN_SIZE, MAX_SIZE);
         Fonts {
             sizes: SizesSection {
-                diff: clamp(cfg.sizes.diff),
-                commit_summary: clamp(cfg.sizes.commit_summary),
-                commit_meta: clamp(cfg.sizes.commit_meta),
-                refs: clamp(cfg.sizes.refs),
-                file_list: clamp(cfg.sizes.file_list),
-                ui: clamp(cfg.sizes.ui),
+                diff: clamp(cfg.sizes.diff, d.diff),
+                commit_summary: clamp(cfg.sizes.commit_summary, d.commit_summary),
+                commit_meta: clamp(cfg.sizes.commit_meta, d.commit_meta),
+                refs: clamp(cfg.sizes.refs, d.refs),
+                file_list: clamp(cfg.sizes.file_list, d.file_list),
+                ui: clamp(cfg.sizes.ui, d.ui),
             },
             families: cfg.families.clone(),
         }
@@ -146,12 +147,12 @@ pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("gitkay").join("config.toml"))
 }
 
-pub fn cache_path() -> Option<PathBuf> {
+fn cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("gitkay").join("fonts.toml"))
 }
 
 /// A fully-commented config showing every default. Written on first run.
-pub fn default_template() -> String {
+fn default_template() -> String {
     let s = SizesSection::default();
     format!(
         "# gitkay font configuration — ~/.config/gitkay/config.toml\n\
@@ -159,11 +160,12 @@ pub fn default_template() -> String {
          # default value. Uncomment and edit to override. Changes apply live on save.\n\
          \n\
          [fonts]\n\
-         # Named families, resolved from installed system fonts (cached after the\n\
-         # first lookup). Leave unset to use gitkay's bundled fonts.\n\
+         # Named families: resolved from installed system fonts; the resolved\n\
+         # path is cached in ~/.cache/gitkay/fonts.toml across restarts.\n\
+         # Leave unset to use gitkay's bundled fonts.\n\
          # monospace = \"JetBrains Mono\"\n\
          # proportional = \"Inter\"\n\
-         # Explicit file paths that skip system-font lookup entirely:\n\
+         # Explicit file paths skip the named-family lookup and cache entirely:\n\
          # monospace_path = \"/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf\"\n\
          # proportional_path = \"/usr/share/fonts/TTF/Inter-Regular.ttf\"\n\
          \n\
@@ -193,7 +195,8 @@ pub fn default_template() -> String {
 }
 
 /// Best-effort write of the default template. Failures (e.g. read-only FS) are
-/// silently ignored — the app proceeds on in-memory defaults.
+/// ignored — a missing file also yields defaults via `read_config`, so startup
+/// is unaffected.
 pub fn write_default_template(path: &Path) {
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
@@ -205,14 +208,14 @@ pub fn write_default_template(path: &Path) {
 
 /// Resolve a configured family name to a font file, using the cache first and
 /// the injected `scan` (fontdb) only on a miss or a stale entry.
-pub fn resolve_font_path(
+fn resolve_font_path(
     name: &str,
     cache: &mut BTreeMap<String, String>,
     exists: &impl Fn(&Path) -> bool,
     scan: &mut impl FnMut(&str) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(cached) = cache.get(name).cloned() {
-        let pb = PathBuf::from(&cached);
+        let pb = PathBuf::from(cached);
         if exists(&pb) {
             return Some(pb);
         }
@@ -225,7 +228,7 @@ pub fn resolve_font_path(
 
 /// Pick a font source for one family: an explicit path wins outright; otherwise
 /// resolve the name (cache + scan). Returns `None` when neither is configured.
-pub fn family_source(
+fn family_source(
     name: &Option<String>,
     path: &Option<String>,
     cache: &mut BTreeMap<String, String>,
@@ -239,20 +242,126 @@ pub fn family_source(
     resolve_font_path(name, cache, exists, scan)
 }
 
-pub fn load_cache(path: &Path) -> BTreeMap<String, String> {
+fn load_cache(path: &Path) -> BTreeMap<String, String> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-pub fn save_cache(path: &Path, cache: &BTreeMap<String, String>) {
+fn save_cache(path: &Path, cache: &BTreeMap<String, String>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(s) = toml::to_string(cache) {
         let _ = std::fs::write(path, s);
     }
+}
+
+/// Insert `bytes` under `key` and make it the primary font for `family`,
+/// keeping egui's bundled fonts as fallbacks.
+fn apply_family(
+    defs: &mut egui::FontDefinitions,
+    key: &str,
+    family: egui::FontFamily,
+    bytes: Vec<u8>,
+) {
+    defs.font_data.insert(
+        key.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    defs.families.entry(family).or_default().insert(0, key.to_owned());
+}
+
+fn fontdb_scan(db: &fontdb::Database, name: &str) -> Option<PathBuf> {
+    // fontdb::Query has no Default impl — every field is written explicitly.
+    let query = fontdb::Query {
+        families: &[fontdb::Family::Name(name)],
+        weight: fontdb::Weight::NORMAL,
+        stretch: fontdb::Stretch::Normal,
+        style: fontdb::Style::Normal,
+    };
+    let id = db.query(&query)?;
+    let (source, _index) = db.face_source(id)?;
+    match source {
+        fontdb::Source::File(path) => Some(path),
+        fontdb::Source::SharedFile(path, _) => Some(path),
+        // In-memory font (no file path) — can't load it as a user override; treat as not found.
+        fontdb::Source::Binary(_) => None,
+    }
+}
+
+/// Resolve both configured families, build the egui font set (bundled fonts plus
+/// any user overrides), and the clamped per-role settings (`Fonts`); returns any
+/// font-load warning messages. fontdb is loaded lazily.
+pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) {
+    let mut defs = egui::FontDefinitions::default();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let cache_file = cache_path();
+    let mut cache = if cfg.fonts.monospace.is_some() || cfg.fonts.proportional.is_some() {
+        cache_file.as_ref().map(|p| load_cache(p)).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let exists = |p: &Path| p.exists();
+
+    let mut db: Option<fontdb::Database> = None;
+    let mut scan = |name: &str| -> Option<PathBuf> {
+        let db = db.get_or_insert_with(|| {
+            let mut d = fontdb::Database::new();
+            d.load_system_fonts();
+            d
+        });
+        fontdb_scan(db, name)
+    };
+
+    let mono = family_source(
+        &cfg.fonts.monospace,
+        &cfg.fonts.monospace_path,
+        &mut cache,
+        &exists,
+        &mut scan,
+    );
+    if let Some(path) = mono {
+        match std::fs::read(&path) {
+            Ok(bytes) => apply_family(&mut defs, "user_monospace", egui::FontFamily::Monospace, bytes),
+            Err(e) => {
+                let msg = format!("failed to read font {path:?}: {e}");
+                eprintln!("gitkay: {msg}");
+                warnings.push(msg);
+            }
+        }
+    }
+
+    let prop = family_source(
+        &cfg.fonts.proportional,
+        &cfg.fonts.proportional_path,
+        &mut cache,
+        &exists,
+        &mut scan,
+    );
+    if let Some(path) = prop {
+        match std::fs::read(&path) {
+            Ok(bytes) => apply_family(&mut defs, "user_proportional", egui::FontFamily::Proportional, bytes),
+            Err(e) => {
+                let msg = format!("failed to read font {path:?}: {e}");
+                eprintln!("gitkay: {msg}");
+                warnings.push(msg);
+            }
+        }
+    }
+
+    // Only persist when we actually resolved something — keeps the default
+    // (no named fonts) path from writing an empty cache file, and keeps unit
+    // tests free of filesystem side effects.
+    if let Some(p) = cache_file
+        && !cache.is_empty()
+    {
+        save_cache(&p, &cache);
+    }
+
+    (defs, Fonts::from_config(cfg), warnings)
 }
 
 #[cfg(test)]
@@ -418,5 +527,117 @@ mod tests {
         let mut scan = |_: &str| None;
         assert_eq!(resolve_font_path("Fira", &mut cache, &exists, &mut scan), None);
         assert!(!cache.contains_key("Fira"), "stale entry should be evicted");
+    }
+
+    #[test]
+    fn apply_family_inserts_font_first() {
+        let mut defs = egui::FontDefinitions::default();
+        apply_family(&mut defs, "user_mono", egui::FontFamily::Monospace, vec![1, 2, 3]);
+        assert!(defs.font_data.contains_key("user_mono"));
+        assert_eq!(
+            defs.families.get(&egui::FontFamily::Monospace).unwrap().first(),
+            Some(&"user_mono".to_owned())
+        );
+    }
+
+    #[test]
+    fn build_fonts_default_adds_no_user_fonts() {
+        let (defs, _fonts, warns) = build_fonts(&Config::default());
+        assert!(!defs.font_data.contains_key("user_monospace"));
+        assert!(!defs.font_data.contains_key("user_proportional"));
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn nan_size_falls_back_to_default() {
+        let mut cfg = Config::default();
+        cfg.sizes.diff = f32::NAN;
+        let fonts = Fonts::from_config(&cfg);
+        assert!(fonts.font_id(Role::Diff).size.is_finite());
+        assert_eq!(fonts.font_id(Role::Diff).size, 13.0);
+    }
+
+    #[test]
+    fn inf_size_clamps_to_bounds() {
+        let mut cfg = Config::default();
+        cfg.sizes.diff = f32::INFINITY;
+        cfg.sizes.ui = f32::NEG_INFINITY;
+        let fonts = Fonts::from_config(&cfg);
+        assert_eq!(fonts.font_id(Role::Diff).size, 64.0);
+        assert_eq!(fonts.font_id(Role::Ui).size, 4.0);
+    }
+
+    #[test]
+    fn file_stats_floored_at_min_size() {
+        let mut cfg = Config::default();
+        cfg.sizes.file_list = 4.0; // already MIN_SIZE
+        let fonts = Fonts::from_config(&cfg);
+        assert_eq!(fonts.file_stats_font_id().size, 4.0); // 4-2=2, floored to 4
+    }
+
+    #[test]
+    fn every_role_maps_to_its_size_and_family() {
+        let mut cfg = Config::default();
+        // make families distinguishable: set all to proportional
+        cfg.families.diff = Family::Proportional;
+        cfg.families.commit_summary = Family::Proportional;
+        cfg.families.commit_meta = Family::Proportional;
+        cfg.families.refs = Family::Proportional;
+        cfg.families.file_list = Family::Proportional;
+        cfg.families.ui = Family::Proportional;
+        let f = Fonts::from_config(&cfg);
+        for (role, size) in [
+            (Role::Diff, 13.0),
+            (Role::CommitSummary, 13.0),
+            (Role::CommitMeta, 12.0),
+            (Role::Refs, 11.0),
+            (Role::FileList, 12.0),
+            (Role::Ui, 13.0),
+        ] {
+            let id = f.font_id(role);
+            assert_eq!(id.size, size, "size for {role:?}");
+            assert_eq!(id.family, egui::FontFamily::Proportional, "family for {role:?}");
+        }
+    }
+
+    #[test]
+    fn build_fonts_bad_explicit_path_warns_and_falls_back() {
+        let mut cfg = Config::default();
+        cfg.fonts.monospace_path = Some("/nonexistent/gitkay-test-font.ttf".to_owned());
+        let (defs, _fonts, warns) = build_fonts(&cfg);
+        assert!(!defs.font_data.contains_key("user_monospace"));
+        assert!(!warns.is_empty());
+    }
+
+    #[test]
+    fn family_source_name_set_but_scan_misses_returns_none() {
+        let mut cache = BTreeMap::new();
+        let exists = |_: &Path| true;
+        let mut scan = |_: &str| -> Option<PathBuf> { None };
+        let got = family_source(&Some("UnknownFont".to_owned()), &None, &mut cache, &exists, &mut scan);
+        assert_eq!(got, None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn invalid_family_string_is_a_parse_error() {
+        assert!(toml::from_str::<Config>("[families]\ndiff = \"bold\"\n").is_err());
+    }
+
+    #[test]
+    fn build_fonts_bad_proportional_path_warns_and_falls_back() {
+        let mut cfg = Config::default();
+        cfg.fonts.proportional_path = Some("/nonexistent/gitkay-test-prop-font.ttf".to_owned());
+        let (defs, _fonts, warns) = build_fonts(&cfg);
+        assert!(!defs.font_data.contains_key("user_proportional"));
+        assert!(!warns.is_empty());
+    }
+
+    #[test]
+    fn invalid_toml_returns_err() {
+        let p = std::env::temp_dir().join("gitkay_bad_config_round2_test.toml");
+        std::fs::write(&p, "not valid [ toml").unwrap();
+        assert!(read_config(&p).is_err());
+        let _ = std::fs::remove_file(&p);
     }
 }
