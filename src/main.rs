@@ -1002,11 +1002,11 @@ impl eframe::App for GitkApp {
                         self.search_cursor = 0;
                         self.refresh_search_matches();
                         // Jump to first match
-                        if let Some(&idx) = self.search_matches.first() {
-                            if let Ok(repo) = Repository::discover(&self.repo_path) {
-                                let oid = self.commits[idx].oid;
-                                self.refresh_for_selection(&repo, oid);
-                            }
+                        if let Some(&idx) = self.search_matches.first()
+                            && let Ok(repo) = Repository::discover(&self.repo_path)
+                        {
+                            let oid = self.commits[idx].oid;
+                            self.refresh_for_selection(&repo, oid);
                         }
                     }
                     // Enter cycles through matches
