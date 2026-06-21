@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod config;
+use config::Fonts;
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -801,6 +802,8 @@ struct GitkApp {
     diff_context: u32,      // diff context lines (persisted)
     diff_ignore_ws: bool,   // ignore all whitespace in diffs (persisted)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
+    fonts: Fonts,                          // role -> FontId map from config
+    config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
 }
 
 impl GitkApp {
@@ -813,6 +816,28 @@ impl GitkApp {
         style.visuals.faint_bg_color = SURFACE0;
         style.visuals.override_text_color = Some(TEXT);
         cc.egui_ctx.set_style(style);
+
+        // ── Fonts & sizes config ──
+        // Optional ~/.config/gitkay/config.toml. With no file (or the freshly
+        // written commented template) this reproduces today's look exactly.
+        let config_path = config::config_path();
+        if let Some(ref p) = config_path
+            && !p.exists()
+        {
+            config::write_default_template(p);
+        }
+        let cfg = config_path
+            .as_ref()
+            .map(|p| match config::read_config(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("gitkay: {e}; using defaults");
+                    config::Config::default()
+                }
+            })
+            .unwrap_or_default();
+        let (font_defs, fonts) = config::build_fonts(&cfg);
+        cc.egui_ctx.set_fonts(font_defs);
 
         let repo = Repository::discover(&repo_path).expect("Not a git repository");
         let commits = load_commits(&repo, 200);
@@ -927,6 +952,8 @@ impl GitkApp {
             diff_context,
             diff_ignore_ws,
             diff_toolbar_rect: None,
+            fonts,
+            config_path,
         }
     }
 
