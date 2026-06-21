@@ -1569,12 +1569,17 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
+            .with_app_id("gitkay")
             .with_title(&title),
         ..Default::default()
     };
 
+    // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
+    // match window rules on app_id, and so eframe uses a stable storage dir for
+    // the persisted layout regardless of which repo is open. (egui-winit 0.31
+    // applies app_id only on Wayland; it does NOT set the X11 WM_CLASS.)
     eframe::run_native(
-        &title,
+        "gitkay",
         options,
         Box::new(move |cc| Ok(Box::new(GitkApp::new(cc, repo_path)))),
     )
