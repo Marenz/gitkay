@@ -56,7 +56,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gitkay-${{ matrix.target }}
-          path: gitkay-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: gitkay-*-${{ matrix.target }}.tar.gz
 
   rpm:
     name: Build RPM
@@ -169,10 +169,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -183,12 +179,18 @@ jobs:
           mkdir release
           cp artifacts/gitkay-x86_64-unknown-linux-gnu/*.tar.gz release/
           cp artifacts/gitkay-aarch64-unknown-linux-gnu/*.tar.gz release/
-          cp artifacts/gitkay-rpm/**/*.rpm release/ 2>/dev/null || true
+          cp artifacts/gitkay-rpm/*/*.rpm release/
           cp artifacts/gitkay-deb/*.deb release/
           ls -la release/
+          for ext in tar.gz rpm deb; do
+            ls release/*."$ext" >/dev/null || { echo "::error::no .$ext artifact in release/"; exit 1; }
+          done
 
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
-        run: gh release create "$REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --notes ""
+        run: |
+          gh release view "$REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$REF_NAME" --repo "$GITHUB_REPOSITORY" --notes ""
+          gh release upload "$REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
