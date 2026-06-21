@@ -802,8 +802,42 @@ struct GitkApp {
     diff_context: u32,      // diff context lines (persisted)
     diff_ignore_ws: bool,   // ignore all whitespace in diffs (persisted)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
-    fonts: Fonts,                          // role -> FontId map from config
+    fonts: Fonts,                          // resolved, clamped font settings; call .font_id(role) for a FontId
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
+    needs_config_reload: Arc<AtomicBool>,  // set by the config-file watcher
+    _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
+    config_error_toast: Option<std::time::Instant>, // transient parse-error notice
+}
+
+/// Build a notify watcher whose callback sets `flag` and requests a repaint for
+/// events matching `keep`. Returns None (logged) if the watcher can't be created;
+/// per-event OS watch errors are silently dropped.
+fn make_watcher(
+    ctx: &egui::Context,
+    flag: Arc<AtomicBool>,
+    keep: impl Fn(&notify::Event) -> bool + Send + 'static,
+) -> Option<RecommendedWatcher> {
+    let ctx = ctx.clone();
+    notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res
+            && keep(&event)
+        {
+            flag.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+        }
+    })
+    .map_err(|e| eprintln!("gitkay: watcher: {e}"))
+    .ok()
+}
+
+fn show_toast(ui: &mut egui::Ui, toast: &mut Option<std::time::Instant>, secs: f32, text: &str, color: egui::Color32, font: egui::FontId) {
+    if let Some(t) = *toast {
+        if t.elapsed().as_secs_f32() < secs {
+            ui.label(egui::RichText::new(text).color(color).font(font));
+        } else {
+            *toast = None;
+        }
+    }
 }
 
 impl GitkApp {
@@ -826,18 +860,47 @@ impl GitkApp {
         {
             config::write_default_template(p);
         }
+        let mut startup_issue = false;
         let cfg = config_path
             .as_ref()
             .map(|p| match config::read_config(p) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("gitkay: {e}; using defaults");
+                    startup_issue = true;
                     config::Config::default()
                 }
             })
             .unwrap_or_default();
-        let (font_defs, fonts) = config::build_fonts(&cfg);
+        let (font_defs, fonts, font_warnings) = config::build_fonts(&cfg);
+        if !font_warnings.is_empty() {
+            startup_issue = true;
+        }
         cc.egui_ctx.set_fonts(font_defs);
+
+        // Watch the config file for live reload. Watch the *parent dir*
+        // (non-recursive) so edits via atomic rename (temp file + rename, as
+        // many editors do) are still seen, then filter events to the file.
+        // Note: an atomic rename shows up as a Create (not Modify) event,
+        // which is why both EventKind::Create and EventKind::Modify are matched.
+        let needs_config_reload = Arc::new(AtomicBool::new(false));
+        let config_watcher = config_path.as_ref().and_then(|cfg_file| {
+            let parent = cfg_file.parent()?.to_path_buf();
+            let cfg_file = cfg_file.clone();
+            let mut w = make_watcher(&cc.egui_ctx, needs_config_reload.clone(), move |event| {
+                matches!(event.kind, notify::EventKind::Create(_) | notify::EventKind::Modify(_))
+                    && event.paths.iter().any(|p| p == &cfg_file)
+            })?;
+            w.watch(&parent, RecursiveMode::NonRecursive)
+                .map_err(|e| eprintln!("gitkay: config watcher: {e}"))
+                .ok()?;
+            Some(w)
+        });
+
+        if config_path.is_some() && config_watcher.is_none() {
+            eprintln!("gitkay: live-reload disabled (config watcher failed to start)");
+            startup_issue = true;
+        }
 
         let repo = Repository::discover(&repo_path).expect("Not a git repository");
         let commits = load_commits(&repo, 200);
@@ -871,23 +934,15 @@ impl GitkApp {
         // Watch .git directory for changes (refs, HEAD, index)
         let needs_reload = Arc::new(AtomicBool::new(false));
         let watcher = {
-            let needs_reload = needs_reload.clone();
-            let ctx = cc.egui_ctx.clone();
             let git_dir = repo.path().to_path_buf();
-            let mut watcher =
-                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    if let Ok(event) = res {
-                        use notify::EventKind::*;
-                        match event.kind {
-                            Create(_) | Modify(_) | Remove(_) => {
-                                needs_reload.store(true, Ordering::Relaxed);
-                                ctx.request_repaint();
-                            }
-                            _ => {}
-                        }
-                    }
-                })
-                .ok();
+            let mut watcher = make_watcher(&cc.egui_ctx, needs_reload.clone(), |event| {
+                matches!(
+                    event.kind,
+                    notify::EventKind::Create(_)
+                        | notify::EventKind::Modify(_)
+                        | notify::EventKind::Remove(_)
+                )
+            });
             if let Some(ref mut w) = watcher {
                 // Watch worktree-specific files
                 let _ = w.watch(&git_dir.join("HEAD"), RecursiveMode::NonRecursive);
@@ -954,6 +1009,9 @@ impl GitkApp {
             diff_toolbar_rect: None,
             fonts,
             config_path,
+            needs_config_reload,
+            _config_watcher: config_watcher,
+            config_error_toast: startup_issue.then(std::time::Instant::now),
         }
     }
 
@@ -1066,6 +1124,29 @@ impl eframe::App for GitkApp {
             self.load_selected_diff(&repo);
         }
 
+        // Live-reload fonts when the config file changes. On a parse error, keep
+        // the current fonts and flash a toast — never blank the UI.
+        if self.needs_config_reload.swap(false, Ordering::Relaxed)
+            && let Some(ref p) = self.config_path
+        {
+            match config::read_config(p) {
+                Ok(cfg) => {
+                    let (defs, fonts, warns) = config::build_fonts(&cfg);
+                    ctx.set_fonts(defs);
+                    self.fonts = fonts;
+                    if warns.is_empty() {
+                        self.config_error_toast = None;
+                    } else {
+                        self.config_error_toast = Some(std::time::Instant::now());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("gitkay: {e}");
+                    self.config_error_toast = Some(std::time::Instant::now());
+                }
+            }
+        }
+
         let row_height = 20.0;
         let col_width = 12.0;
         let dot_radius = 3.5;
@@ -1169,6 +1250,7 @@ impl eframe::App for GitkApp {
                         }
                         resp.request_focus();
                     }
+                    let ui_font = self.fonts.font_id(Role::Ui);
                     if !self.search_matches.is_empty() {
                         ui.label(
                             egui::RichText::new(format!(
@@ -1177,17 +1259,13 @@ impl eframe::App for GitkApp {
                                 self.search_matches.len()
                             ))
                             .color(SUBTEXT)
-                            .size(12.0),
+                            .font(self.fonts.font_id(Role::Ui)),
                         );
                     }
                     // Copied toast
-                    if let Some(t) = self.copied_toast {
-                        if t.elapsed().as_secs_f32() < 2.0 {
-                            ui.label(egui::RichText::new("SHA copied!").color(GREEN).size(12.0));
-                        } else {
-                            self.copied_toast = None;
-                        }
-                    }
+                    show_toast(ui, &mut self.copied_toast, 2.0, "SHA copied!", GREEN, ui_font.clone());
+                    // Config-error toast
+                    show_toast(ui, &mut self.config_error_toast, 4.0, "config error — see terminal", RED, ui_font);
                 });
             });
 
@@ -1288,7 +1366,7 @@ impl eframe::App for GitkApp {
                             ui.label(
                                 egui::RichText::new(format!("{} files", self.diff_files.len()))
                                     .color(SUBTEXT)
-                                    .size(11.0),
+                                    .font(self.fonts.font_id(Role::Ui)),
                             );
                             ui.add_space(4.0);
                             egui::ScrollArea::vertical()
