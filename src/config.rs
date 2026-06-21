@@ -4,7 +4,6 @@
 
 use eframe::egui;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const MIN_SIZE: f32 = 4.0;
@@ -142,6 +141,67 @@ impl Fonts {
     }
 }
 
+pub fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("gitkay").join("config.toml"))
+}
+
+pub fn cache_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("gitkay").join("fonts.toml"))
+}
+
+/// A fully-commented config showing every default. Written on first run.
+pub fn default_template() -> String {
+    let s = SizesSection::default();
+    format!(
+        "# gitkay font configuration — ~/.config/gitkay/config.toml\n\
+         # This file is optional. Every line below is commented out and shows its\n\
+         # default value. Uncomment and edit to override. Changes apply live on save.\n\
+         \n\
+         [fonts]\n\
+         # Named families, resolved from installed system fonts (cached after the\n\
+         # first lookup). Leave unset to use gitkay's bundled fonts.\n\
+         # monospace = \"JetBrains Mono\"\n\
+         # proportional = \"Inter\"\n\
+         # Explicit file paths that skip system-font lookup entirely:\n\
+         # monospace_path = \"/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf\"\n\
+         # proportional_path = \"/usr/share/fonts/TTF/Inter-Regular.ttf\"\n\
+         \n\
+         [sizes]\n\
+         # diff = {diff}\n\
+         # commit_summary = {commit_summary}\n\
+         # commit_meta = {commit_meta}   # date / SHA / author\n\
+         # refs = {refs}\n\
+         # file_list = {file_list}     # filenames; +/- stats render 2px smaller\n\
+         # ui = {ui}            # search bar + diff toolbar\n\
+         \n\
+         [families]\n\
+         # Which family each role uses: \"monospace\" or \"proportional\".\n\
+         # diff = \"monospace\"\n\
+         # commit_summary = \"monospace\"\n\
+         # commit_meta = \"monospace\"\n\
+         # refs = \"monospace\"\n\
+         # file_list = \"monospace\"\n\
+         # ui = \"monospace\"\n",
+        diff = s.diff,
+        commit_summary = s.commit_summary,
+        commit_meta = s.commit_meta,
+        refs = s.refs,
+        file_list = s.file_list,
+        ui = s.ui,
+    )
+}
+
+/// Best-effort write of the default template. Failures (e.g. read-only FS) are
+/// silently ignored — the app proceeds on in-memory defaults.
+pub fn write_default_template(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(path, default_template());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +279,21 @@ mod tests {
         let fonts = Fonts::from_config(&Config::default());
         assert_eq!(fonts.font_id(Role::FileList).size, 12.0);
         assert_eq!(fonts.file_stats_font_id().size, 10.0);
+    }
+
+    #[test]
+    fn template_is_valid_toml_yielding_defaults() {
+        // All values are commented out, so parsing yields the defaults.
+        let cfg: Config = toml::from_str(&default_template()).unwrap();
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn template_documents_real_default_values() {
+        let t = default_template();
+        assert!(t.contains("# diff = 13"));
+        assert!(t.contains("# commit_meta = 12"));
+        assert!(t.contains("# refs = 11"));
+        assert!(t.contains("# ui = 13"));
     }
 }
