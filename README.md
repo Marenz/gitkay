@@ -68,6 +68,18 @@
 
 ## Install
 
+### Gentoo
+
+Packaged in the [GURU](https://wiki.gentoo.org/wiki/Project:GURU) overlay.
+
+```sh
+# Enable the GURU repository (needs app-eselect/eselect-repository)
+sudo eselect repository enable guru
+sudo emaint sync -r guru
+
+sudo emerge --ask dev-vcs/gitkay
+```
+
 ### From source (recommended)
 
 ```sh
@@ -123,9 +135,10 @@ gitkay /path/to/repo
 | Action | Effect |
 |---|---|
 | **Click** commit | Select, show diff, copy SHA to clipboard |
+| **↑ / ↓** | Select previous / next commit (view follows) |
 | **Scroll** | Browse history (lazy loads more commits) |
 | **Start typing** (anywhere) | Focus search bar and filter by SHA / author / message / branch / tag |
-| **Enter** in search | Cycle through matches, graph scrolls to match |
+| **Enter** / **↑** / **↓** in search | Cycle through matches, graph scrolls to match |
 | **Click** file in sidebar | Jump to file's diff section |
 | **Hover** file in sidebar | Full path tooltip |
 

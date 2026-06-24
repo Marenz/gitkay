@@ -3,8 +3,8 @@ use eframe::egui;
 use git2::{DiffOptions, Repository, Sort};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -54,10 +54,11 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
             // Actually: staged = index vs HEAD tree
             if let Some(head) = head_oid
                 && let Ok(head_commit) = repo.find_commit(head)
-                    && let Ok(head_tree) = head_commit.tree()
-                        && let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None) {
-                            return diff.deltas().len() > 0;
-                        }
+                && let Ok(head_tree) = head_commit.tree()
+                && let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None)
+            {
+                return diff.deltas().len() > 0;
+            }
             false
         });
 
@@ -211,13 +212,27 @@ struct DiffData {
     files: Vec<FileEntry>,
 }
 
-fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
+/// Diff rendering options controlled from the toolbar.
+#[derive(Clone, Copy)]
+struct DiffSettings {
+    context: u32,
+    ignore_ws: bool,
+}
+
+fn diff_opts(settings: DiffSettings) -> DiffOptions {
+    let mut opts = DiffOptions::new();
+    opts.context_lines(settings.context)
+        .ignore_whitespace(settings.ignore_ws);
+    opts
+}
+
+fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> DiffData {
     // Handle virtual entries
     if oid == oid_uncommitted() {
-        return get_working_tree_diff(repo);
+        return get_working_tree_diff(repo, settings);
     }
     if oid == oid_staged() {
-        return get_staged_diff(repo);
+        return get_staged_diff(repo, settings);
     }
 
     let commit = match repo.find_commit(oid) {
@@ -226,7 +241,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     let tree = match commit.tree() {
@@ -235,19 +250,19 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
-    let mut opts = DiffOptions::new();
+    let mut opts = diff_opts(settings);
     let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
 
@@ -295,11 +310,12 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
 
     // Stats
     if let Ok(stats) = diff.stats()
-        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
+        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
+    {
+        for l in s.as_str().unwrap_or("").lines() {
+            lines.push(DiffLine::new(l, LineKind::Stat));
         }
+    }
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch — track which file we're in
@@ -369,33 +385,35 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
-fn get_working_tree_diff(repo: &Repository) -> DiffData {
-    let diff = match repo.diff_index_to_workdir(None, None) {
+fn get_working_tree_diff(repo: &Repository, settings: DiffSettings) -> DiffData {
+    let mut opts = diff_opts(settings);
+    let diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     diff_to_data(&diff, "Uncommitted changes (working tree)")
 }
 
 /// Generate diff for staged changes (index vs HEAD).
-fn get_staged_diff(repo: &Repository) -> DiffData {
+fn get_staged_diff(repo: &Repository, settings: DiffSettings) -> DiffData {
     let head_tree = repo
         .head()
         .ok()
         .and_then(|h| h.peel_to_commit().ok())
         .and_then(|c| c.tree().ok());
-    let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+    let mut opts = diff_opts(settings);
+    let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     diff_to_data(&diff, "Staged changes (index)")
@@ -430,11 +448,12 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
 
     // Stats
     if let Ok(stats) = diff.stats()
-        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
+        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
+    {
+        for l in s.as_str().unwrap_or("").lines() {
+            lines.push(DiffLine::new(l, LineKind::Stat));
         }
+    }
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch
@@ -768,7 +787,7 @@ struct GitkApp {
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
     diff_scroll_to: Option<usize>,
-    graph_scroll_to: Option<usize>, // commit index to scroll to in graph view
+    graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     search_text: String,
     search_matches: Vec<usize>,
@@ -778,6 +797,11 @@ struct GitkApp {
     needs_reload: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
+    diff_panel_height: f32,           // persisted diff-panel splitter height (see App::save)
+    file_list_width: f32,             // persisted file-list sidebar width (see App::save)
+    diff_context: u32,                // diff context lines (persisted)
+    diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
+    diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
 }
 
 impl GitkApp {
@@ -795,9 +819,25 @@ impl GitkApp {
         let commits = load_commits(&repo, 200);
         let graph_rows = layout_graph(&commits);
 
+        // Restore persisted diff options before the first diff is generated, so
+        // the startup diff honours them.
+        let diff_context: u32 = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "diff_context"))
+            .unwrap_or(3)
+            .min(99); // clamp a stale/hand-edited value to the UI range
+        let diff_ignore_ws: bool = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "diff_ignore_ws"))
+            .unwrap_or(false);
+        let diff_settings = DiffSettings {
+            context: diff_context,
+            ignore_ws: diff_ignore_ws,
+        };
+
         // Auto-select first commit and load its diff
         let (diff_lines, diff_files) = if let Some(first) = commits.first() {
-            let data = get_diff_data(&repo, first.oid);
+            let data = get_diff_data(&repo, first.oid, diff_settings);
             (data.lines, data.files)
         } else {
             (Vec::new(), Vec::new())
@@ -856,6 +896,16 @@ impl GitkApp {
             watcher
         };
 
+        // Restore the persisted layout sizes (written in App::save).
+        let diff_panel_height: f32 = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "diff_panel_height"))
+            .unwrap_or(300.0);
+        let file_list_width: f32 = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "file_list_width"))
+            .unwrap_or(200.0);
+
         Self {
             commits,
             graph_rows,
@@ -873,6 +923,11 @@ impl GitkApp {
             needs_reload,
             _watcher: watcher,
             branch_highlight: HashSet::new(),
+            diff_panel_height,
+            file_list_width,
+            diff_context,
+            diff_ignore_ws,
+            diff_toolbar_rect: None,
         }
     }
 
@@ -910,11 +965,18 @@ impl GitkApp {
         };
     }
 
+    fn diff_settings(&self) -> DiffSettings {
+        DiffSettings {
+            context: self.diff_context,
+            ignore_ws: self.diff_ignore_ws,
+        }
+    }
+
     fn load_selected_diff(&mut self, repo: &Repository) {
         if let Some(sel) = self.selected
             && sel < self.commits.len()
         {
-            let data = get_diff_data(repo, self.commits[sel].oid);
+            let data = get_diff_data(repo, self.commits[sel].oid, self.diff_settings());
             self.diff_lines = data.lines;
             self.diff_files = data.files;
         } else {
@@ -950,15 +1012,31 @@ impl GitkApp {
     fn refresh_for_selection(&mut self, repo: &Repository, preferred_oid: git2::Oid) {
         self.reload_commits(repo, Some(preferred_oid));
         self.load_selected_diff(repo);
-        self.graph_scroll_to = self.selected;
+        // Center the target (used for clicks, search jumps): the destination may
+        // be far from the current view.
+        self.graph_scroll_to = self.selected.map(|i| (i, Some(egui::Align::Center)));
     }
 }
 
 impl eframe::App for GitkApp {
+    // Persist only the diff-panel splitter height (below), not the whole egui
+    // memory blob — persisting the blob would also restore scroll positions.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "diff_panel_height", &self.diff_panel_height);
+        eframe::set_value(storage, "file_list_width", &self.file_list_width);
+        eframe::set_value(storage, "diff_context", &self.diff_context);
+        eframe::set_value(storage, "diff_ignore_ws", &self.diff_ignore_ws);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Auto-reload when git refs change
         if self.needs_reload.swap(false, Ordering::Relaxed)
-            && let Ok(repo) = Repository::discover(&self.repo_path) {
+            && let Ok(repo) = Repository::discover(&self.repo_path)
+        {
             self.reload_commits(&repo, None);
             self.load_selected_diff(&repo);
         }
@@ -972,7 +1050,7 @@ impl eframe::App for GitkApp {
 
         // Any printable keypress when search bar is not focused → focus it.
         // The TextEdit will pick up the pending Text event once it has focus.
-        let search_has_focus = ctx.memory(|m| m.has_focus(search_id));
+        let mut search_has_focus = ctx.memory(|m| m.has_focus(search_id));
         if !search_has_focus {
             let has_text_event = ctx.input(|i| {
                 i.events
@@ -981,6 +1059,50 @@ impl eframe::App for GitkApp {
             });
             if has_text_event {
                 ctx.memory_mut(|m| m.request_focus(search_id));
+                // Focus takes effect this frame; route keys to search accordingly.
+                search_has_focus = true;
+            }
+        }
+
+        // Up/Down: cycle through search matches when the search bar is focused,
+        // otherwise move the commit-list selection (view follows minimally).
+        let arrow_delta: isize = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                1
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if arrow_delta != 0 {
+            if search_has_focus {
+                if !self.search_matches.is_empty() {
+                    let len = self.search_matches.len() as isize;
+                    self.search_cursor =
+                        (self.search_cursor as isize + arrow_delta).rem_euclid(len) as usize;
+                    // Cycle to the match without reloading the whole history: the
+                    // match index is already valid for the current commit list.
+                    let idx = self.search_matches[self.search_cursor];
+                    self.set_selected(idx);
+                    if let Ok(repo) = Repository::discover(&self.repo_path) {
+                        self.load_selected_diff(&repo);
+                    }
+                    self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+                }
+            } else if !self.commits.is_empty() {
+                let last = self.commits.len() as isize - 1;
+                let new = match self.selected {
+                    Some(s) => (s as isize + arrow_delta).clamp(0, last) as usize,
+                    None => 0,
+                };
+                if Some(new) != self.selected {
+                    self.set_selected(new);
+                    if let Ok(repo) = Repository::discover(&self.repo_path) {
+                        self.load_selected_diff(&repo);
+                    }
+                    self.graph_scroll_to = Some((new, None));
+                }
             }
         }
 
@@ -1002,11 +1124,11 @@ impl eframe::App for GitkApp {
                         self.search_cursor = 0;
                         self.refresh_search_matches();
                         // Jump to first match
-                        if let Some(&idx) = self.search_matches.first() {
-                            if let Ok(repo) = Repository::discover(&self.repo_path) {
-                                let oid = self.commits[idx].oid;
-                                self.refresh_for_selection(&repo, oid);
-                            }
+                        if let Some(&idx) = self.search_matches.first()
+                            && let Ok(repo) = Repository::discover(&self.repo_path)
+                        {
+                            let oid = self.commits[idx].oid;
+                            self.refresh_for_selection(&repo, oid);
                         }
                     }
                     // Enter cycles through matches
@@ -1044,10 +1166,11 @@ impl eframe::App for GitkApp {
             });
 
         // ── Bottom panel: diff view + file list ──
-        egui::TopBottomPanel::bottom("diff_panel")
+        let saved_panel_h = self.diff_panel_height;
+        let diff_panel = egui::TopBottomPanel::bottom("diff_panel")
             .resizable(true)
             .min_height(100.0)
-            .default_height(300.0)
+            .default_height(saved_panel_h)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(4, 0)),
@@ -1058,72 +1181,85 @@ impl eframe::App for GitkApp {
                 ui.separator();
                 ui.add_space(2.0);
 
-                ui.horizontal_top(|ui| {
-                    // Sidebar width driven by file names + stats
-                    let sidebar_width = if self.diff_files.is_empty() {
-                        0.0
-                    } else {
-                        let max_entry_len = self
-                            .diff_files
-                            .iter()
-                            .map(|f| {
-                                let name_len = f.path.rsplit('/').next().unwrap_or(&f.path).len();
-                                let stat_len = format!("+{} -{}", f.additions, f.deletions).len();
-                                name_len + stat_len + 2
-                            })
-                            .max()
-                            .unwrap_or(10);
-                        ((max_entry_len as f32 * 7.5) + 30.0).clamp(140.0, 280.0)
-                    };
-
-                    // Left: diff content (scrollable)
-                    let diff_width = ui.available_width() - sidebar_width - 10.0;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(diff_width.max(200.0), ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
-                            let scroll = egui::ScrollArea::both()
-                                .id_salt("diff_scroll")
-                                .animated(false);
-                            let scroll_target = self.diff_scroll_to.take();
-
-                            scroll.show(ui, |ui| {
-                                for (i, line) in self.diff_lines.iter().enumerate() {
-                                    let color = match line.kind {
-                                        LineKind::Add => GREEN,
-                                        LineKind::Del => RED,
-                                        LineKind::Hunk => BLUE,
-                                        LineKind::Meta => MAUVE,
-                                        LineKind::FileMeta => MAUVE,
-                                        LineKind::FileName => YELLOW,
-                                        LineKind::Stat => SUBTEXT,
-                                        LineKind::Context => TEXT,
-                                    };
-                                    let resp = ui.colored_label(color, &line.text);
-                                    if scroll_target == Some(i) {
-                                        ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
+                // Diff options toolbar — hidden until the pointer is near the top
+                // of the diff panel, then shown as a floating overlay so it never
+                // takes vertical space from the diff.
+                let panel_rect = ui.max_rect();
+                // Anchor the overlay just below the panel's resize-grab strip so it
+                // doesn't sit on top of (and steal drags from) the splitter handle.
+                let toolbar_pos = egui::pos2(panel_rect.min.x, panel_rect.min.y + 8.0);
+                // Hover zone starts below the resize edge and is tall enough to
+                // cover the whole toolbar (avoids flicker at the toolbar's bottom edge).
+                let hover_zone = egui::Rect::from_min_max(
+                    egui::pos2(panel_rect.min.x, panel_rect.min.y + 6.0),
+                    egui::pos2(panel_rect.max.x, panel_rect.min.y + 46.0),
+                );
+                // Reveal when the pointer is over the top strip OR still over the
+                // toolbar itself. Use the raw pointer position rather than
+                // rect_contains_pointer, which is occlusion-aware and flickers
+                // once the foreground overlay slides under the cursor.
+                let show_toolbar = ctx.pointer_hover_pos().is_some_and(|p| {
+                    hover_zone.contains(p)
+                        || self
+                            .diff_toolbar_rect
+                            .is_some_and(|r| r.expand(2.0).contains(p))
+                });
+                let mut diff_opts_changed = false;
+                if show_toolbar {
+                    let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(toolbar_pos)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Context:");
+                                    if ui.small_button("-").clicked() {
+                                        self.diff_context = self.diff_context.saturating_sub(1);
+                                        diff_opts_changed = true;
                                     }
-                                }
+                                    ui.monospace(self.diff_context.to_string());
+                                    if ui.small_button("+").clicked() {
+                                        self.diff_context =
+                                            self.diff_context.saturating_add(1).min(99);
+                                        diff_opts_changed = true;
+                                    }
+                                    ui.add_space(12.0);
+                                    if ui
+                                        .checkbox(&mut self.diff_ignore_ws, "Ignore whitespace")
+                                        .changed()
+                                    {
+                                        diff_opts_changed = true;
+                                    }
+                                });
                             });
-                        },
-                    );
+                        });
+                    self.diff_toolbar_rect = Some(area.response.rect);
+                } else {
+                    self.diff_toolbar_rect = None;
+                }
+                if diff_opts_changed && let Ok(repo) = Repository::discover(&self.repo_path) {
+                    self.load_selected_diff(&repo);
+                }
 
-                    ui.separator();
-
-                    // Right: file list with hover effects
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(sidebar_width, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            if !self.diff_files.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(format!("{} files", self.diff_files.len()))
-                                        .color(SUBTEXT)
-                                        .size(11.0),
-                                );
-                                ui.add_space(4.0);
-                            }
+                // Right: resizable file-list sidebar — draggable splitter, width
+                // persisted across runs (see App::save). Shown only when the
+                // selected commit touches files.
+                let mut divider: Option<egui::Rect> = None;
+                if !self.diff_files.is_empty() {
+                    let saved_w = self.file_list_width;
+                    let file_panel = egui::SidePanel::right("file_list_panel")
+                        .resizable(true)
+                        .default_width(saved_w)
+                        .min_width(140.0)
+                        .max_width(400.0)
+                        .frame(egui::Frame::NONE)
+                        .show_inside(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} files", self.diff_files.len()))
+                                    .color(SUBTEXT)
+                                    .size(11.0),
+                            );
+                            ui.add_space(4.0);
                             egui::ScrollArea::vertical()
                                 .id_salt("file_list")
                                 .show(ui, |ui| {
@@ -1204,10 +1340,75 @@ impl eframe::App for GitkApp {
                                         }
                                     }
                                 });
-                        },
-                    );
-                });
+                        });
+                    // Only persist the width on an actual resize-drag, not when
+                    // egui clamps the panel to a narrow window (which would
+                    // otherwise ratchet the saved width down across launches).
+                    if ctx
+                        .read_response(egui::Id::new("file_list_panel").with("__resize"))
+                        .is_some_and(|r| r.dragged())
+                    {
+                        self.file_list_width = file_panel.response.rect.width();
+                    }
+                    divider = Some(file_panel.response.rect);
+                }
+
+                // Left: diff content fills the remaining width. Right padding keeps
+                // the diff scrollbar from crowding the file-list resize bar — only
+                // when that sidebar is actually shown.
+                let diff_right_pad = if self.diff_files.is_empty() { 0 } else { 10 };
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                        left: 0,
+                        right: diff_right_pad,
+                        top: 0,
+                        bottom: 0,
+                    }))
+                    .show_inside(ui, |ui| {
+                        ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
+                        let scroll = egui::ScrollArea::both()
+                            .id_salt("diff_scroll")
+                            .auto_shrink([false, false])
+                            .animated(false);
+                        let scroll_target = self.diff_scroll_to.take();
+                        scroll.show(ui, |ui| {
+                            for (i, line) in self.diff_lines.iter().enumerate() {
+                                let color = match line.kind {
+                                    LineKind::Add => GREEN,
+                                    LineKind::Del => RED,
+                                    LineKind::Hunk => BLUE,
+                                    LineKind::Meta => MAUVE,
+                                    LineKind::FileMeta => MAUVE,
+                                    LineKind::FileName => YELLOW,
+                                    LineKind::Stat => SUBTEXT,
+                                    LineKind::Context => TEXT,
+                                };
+                                let resp = ui.colored_label(color, &line.text);
+                                if scroll_target == Some(i) {
+                                    ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
+                                }
+                            }
+                        });
+                    });
+
+                // The side panel already draws a separator at the divider that
+                // brightens on hover. Add a second static line a few px into the
+                // gap so the divider reads as a double line — matching the
+                // commit-list / diff separator above.
+                if let Some(r) = divider {
+                    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                    ui.painter().vline(r.left() - 5.0, r.y_range(), stroke);
+                }
             });
+        // Remember the splitter height for next launch (persisted in App::save),
+        // but only on an actual resize-drag — capturing every frame would persist
+        // a window-clamped height and ratchet the saved value down.
+        if ctx
+            .read_response(egui::Id::new("diff_panel").with("__resize"))
+            .is_some_and(|r| r.dragged())
+        {
+            self.diff_panel_height = diff_panel.response.rect.height();
+        }
 
         // ── Central panel: commit graph + list ──
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1252,27 +1453,28 @@ impl eframe::App for GitkApp {
 
                     // Check click — select commit and copy SHA
                     if response.clicked()
-                        && let Some(pos) = response.interact_pointer_pos() {
-                            let row_offset = ((pos.y - top_left.y) / row_height) as usize;
-                            let clicked_idx = row_range.start + row_offset;
-                            if clicked_idx < num_commits {
-                                let commit = &self.commits[clicked_idx];
-                                let clicked_oid = commit.oid;
-                                // Copy SHA to both clipboards
-                                let sha = clicked_oid.to_string();
-                                ctx.copy_text(sha.clone());
-                                // Also set primary selection (middle-click paste)
-                                if let Ok(mut clip) = arboard::Clipboard::new() {
-                                    let _ = clip
-                                        .set()
-                                        .clipboard(arboard::LinuxClipboardKind::Primary)
-                                        .text(&sha);
-                                }
-                                self.copied_toast = Some(std::time::Instant::now());
-                                let repo = Repository::discover(&self.repo_path).unwrap();
-                                self.refresh_for_selection(&repo, clicked_oid);
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
+                        let row_offset = ((pos.y - top_left.y) / row_height) as usize;
+                        let clicked_idx = row_range.start + row_offset;
+                        if clicked_idx < num_commits {
+                            let commit = &self.commits[clicked_idx];
+                            let clicked_oid = commit.oid;
+                            // Copy SHA to both clipboards
+                            let sha = clicked_oid.to_string();
+                            ctx.copy_text(sha.clone());
+                            // Also set primary selection (middle-click paste)
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                let _ = clip
+                                    .set()
+                                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                                    .text(&sha);
                             }
+                            self.copied_toast = Some(std::time::Instant::now());
+                            let repo = Repository::discover(&self.repo_path).unwrap();
+                            self.refresh_for_selection(&repo, clicked_oid);
                         }
+                    }
 
                     for idx in row_range.clone() {
                         let commit = &self.commits[idx];
@@ -1321,11 +1523,7 @@ impl eframe::App for GitkApp {
                                 row_rect.min,
                                 egui::vec2(3.0, row_rect.height()),
                             );
-                            painter.rect_filled(
-                                bar,
-                                0.0,
-                                egui::Color32::from_rgb(249, 226, 175),
-                            );
+                            painter.rect_filled(bar, 0.0, egui::Color32::from_rgb(249, 226, 175));
                         }
                         if self.selected != Some(idx)
                             && response.hover_pos().is_some_and(|p| row_rect.contains(p))
@@ -1515,7 +1713,7 @@ impl eframe::App for GitkApp {
                     }
 
                     // Scroll to target commit if requested
-                    if let Some(target_idx) = graph_scroll_to {
+                    if let Some((target_idx, align)) = graph_scroll_to {
                         // Compute the target rect in the scroll content's coordinate space.
                         // The content origin is at top_left.y - (first_row as f32 * row_height)
                         // (since top_left is after the pre-spacer).
@@ -1525,7 +1723,7 @@ impl eframe::App for GitkApp {
                             egui::pos2(top_left.x, target_y),
                             egui::vec2(1.0, row_height),
                         );
-                        ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+                        ui.scroll_to_rect(target_rect, align);
                     }
 
                     // Post-spacer to maintain correct total scroll height
@@ -1569,12 +1767,22 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
+            .with_app_id("gitkay")
             .with_title(&title),
+        // Persist the egui layout (the diff splitter) but NOT native window
+        // geometry. eframe's window size round-trip is unstable on Wayland
+        // (fractional scaling + client-side decorations) and makes the window
+        // grow on every restart; the window opens at the size set above instead.
+        persist_window: false,
         ..Default::default()
     };
 
+    // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
+    // match window rules on app_id, and so eframe uses a stable storage dir for
+    // the persisted layout regardless of which repo is open. (egui-winit 0.31
+    // applies app_id only on Wayland; it does NOT set the X11 WM_CLASS.)
     eframe::run_native(
-        &title,
+        "gitkay",
         options,
         Box::new(move |cc| Ok(Box::new(GitkApp::new(cc, repo_path)))),
     )
@@ -1788,9 +1996,18 @@ mod tests {
         let highlight = compute_branch_highlight(&commits, 0);
 
         assert!(highlight.contains(&0), "merge commit should be highlighted");
-        assert!(highlight.contains(&1), "first-parent side should be highlighted");
-        assert!(highlight.contains(&2), "merged branch tip should be highlighted");
-        assert!(highlight.contains(&3), "merged branch ancestry should be highlighted");
+        assert!(
+            highlight.contains(&1),
+            "first-parent side should be highlighted"
+        );
+        assert!(
+            highlight.contains(&2),
+            "merged branch tip should be highlighted"
+        );
+        assert!(
+            highlight.contains(&3),
+            "merged branch ancestry should be highlighted"
+        );
     }
 
     #[test]
