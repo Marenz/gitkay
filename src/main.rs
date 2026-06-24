@@ -2371,4 +2371,65 @@ mod tests {
         assert_linear(&rows, &commits, 4, 6);
         assert_colors_consistent(&rows);
     }
+
+    /// Run a single headless egui pass with a fixed screen rect.
+    fn run_egui_pass(build: impl FnMut(&egui::Context)) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        // Assertions run inside `build`; the rendered output is not needed.
+        let _ = ctx.run(input, build);
+    }
+
+    // The splitter-persistence logic reads an egui-internal resize response keyed
+    // `Id::new(<panel_id>).with("__resize")` (see App::update). That id suffix is
+    // not part of egui's public API — if an egui upgrade renames it, the splitters
+    // would silently stop persisting with no compile error. These tests pin the
+    // coupling so such a break fails loudly here instead.
+
+    #[test]
+    fn bottom_panel_resize_response_id_is_stable() {
+        run_egui_pass(|ctx| {
+            egui::TopBottomPanel::bottom("diff_panel")
+                .resizable(true)
+                .min_height(100.0)
+                .default_height(300.0)
+                .show(ctx, |ui| {
+                    ui.label("diff");
+                });
+            assert!(
+                ctx.read_response(egui::Id::new("diff_panel").with("__resize"))
+                    .is_some(),
+                "egui no longer exposes the bottom-panel resize response at \
+                 `diff_panel.__resize`; the diff-panel splitter persistence in \
+                 App::update is broken — update the id there to match egui."
+            );
+        });
+    }
+
+    #[test]
+    fn side_panel_resize_response_id_is_stable() {
+        run_egui_pass(|ctx| {
+            egui::SidePanel::right("file_list_panel")
+                .resizable(true)
+                .default_width(200.0)
+                .min_width(140.0)
+                .max_width(400.0)
+                .show(ctx, |ui| {
+                    ui.label("files");
+                });
+            assert!(
+                ctx.read_response(egui::Id::new("file_list_panel").with("__resize"))
+                    .is_some(),
+                "egui no longer exposes the side-panel resize response at \
+                 `file_list_panel.__resize`; the file-list splitter persistence in \
+                 App::update is broken — update the id there to match egui."
+            );
+        });
+    }
 }
