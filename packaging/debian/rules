@@ -1,6 +1,13 @@
 #!/usr/bin/make -f
+
+# Cargo finds Cargo.toml in the parent dir and would build into ../target
+export CARGO_TARGET_DIR := $(CURDIR)/target
+
 %:
 	dh $@
+
+override_dh_auto_clean:
+	cargo clean
 
 override_dh_auto_build:
 	cargo build --release
