@@ -116,6 +116,7 @@ sudo rpm -i ~/rpmbuild/RPMS/x86_64/gitkay-*.rpm
 ### Ubuntu / Debian .deb
 
 ```sh
+cd packaging
 dpkg-buildpackage -us -uc -b
 sudo dpkg -i ../gitkay_*.deb
 ```

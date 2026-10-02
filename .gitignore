@@ -1,1 +1,9 @@
 /target
+/packaging/target
+/packaging/debian/.debhelper
+/packaging/debian/debhelper-build-stamp
+/packaging/debian/files
+/packaging/debian/gitkay
+/packaging/debian/*.substvars
+/gitkay_*
+/gitkay-dbgsym_*
